@@ -1,0 +1,499 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions 
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.types import *
+import json
+import boto3
+from pyspark.sql.types import Row
+from pyspark.sql.functions import to_date
+import re
+from awsglue import DynamicFrame
+from pyspark.sql.types import IntegerType
+from pyspark.sql.types import DoubleType 
+from pyspark.sql.types import DateType
+import csv
+import pg8000
+from datetime import datetime
+from pyspark.sql.functions import col
+import copy
+from boto3  import client as boto3_client
+
+#CONFIGURATIONS
+configpath = "source_files/PENNAT_DM_STAGE/STAGING_CONFIG_TABLES/LOAD00000001.csv"
+configDQpath = "source_files/PENNAT_DM_STAGE/STAGING_CONFIG_DQ/LOAD00000001.csv"
+bucket = "bhfl-n2p-lms"
+sourcepath = "s3://" + bucket + "/source_files/PENNAT_DM_STAGE/"
+targetpath = "s3://" + bucket + "/tgt-files/PENNAT_DM_STAGE/"
+schema = "lms_stage"
+sourcesystem = "lms"
+ERROR_DESCRIPTION = 'error_description'
+#martschema = "lms_mart"
+
+sysconfigpath = "sysconfig/config.csv"
+s3 = boto3.resource('s3')
+
+statement_timeout = 60
+connect_timeout = 60
+    
+def initconfig():
+    obj = s3.Object(bucket, sysconfigpath)
+    lines= obj.get()['Body'].read().decode("utf-8").splitlines()
+
+    for row in csv.DictReader(lines):
+    	if row["SYSTEM"] == 'lms_mart':
+    		return row["URL"], row['USERNAME'], row['PASSWORD'], row['DB'], int(row['PORT']), int(row['CONNECT_TIME_OUT']), int(row['STATEMENT_TIMEOUT'])
+
+postgreshostname,username,password,databasename,config_port,connect_timeout,statement_timeout= initconfig()
+
+postgresjdbcurl = "jdbc:postgresql://" + postgreshostname + ":" + str(config_port) + "/" + databasename
+
+## @params: [JOB_NAME]
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+JOB_NAME = args['JOB_NAME']
+
+glueContext.clearCache()
+
+def truncateTable(table_name):
+    conn = pg8000.connect(
+        database=databasename, 
+        user=username, 
+        password= password,
+        host=postgreshostname,
+        port=config_port,
+        timeout=connect_timeout
+    )
+    try:
+        cur = conn.cursor()        
+        cur.execute('SET statement_timeout TO %d;' % int(statement_timeout * 1000))
+        cur.execute( "TRUNCATE TABLE " + table_name + ";")  
+        conn.commit()
+    except Exception as e:
+        cur.close() 
+        conn.close()              
+        print("truncateTable " + str(e))
+        raise Exception("truncateTable " + str(e))
+    cur.close() 
+    conn.close()
+    
+def checkorcreateRejectTable(schema,table_name):
+    conn = pg8000.connect(
+        database=databasename, 
+        user=username, 
+        password= password,
+        host=postgreshostname,
+        port=config_port,
+        timeout=connect_timeout
+    )
+    try:
+        cur = conn.cursor()       
+        cur.execute("select exists(select * from information_schema.tables where table_name=%s)", ('.rej_' + table_name,))
+        isExist = cur.fetchone()[0]
+        if not isExist:   
+            cur.execute("CREATE TABLE " + schema + ".rej_" + table_name + " AS SELECT * FROM " + schema + "." + table_name)
+            conn.commit()
+            cur.execute("ALTER TABLE  " + schema + ".rej_" + table_name + " ADD COLUMN error_description CHARACTER VARYING(1000)")     
+            conn.commit()
+    except Exception as e:
+        #cur.close() 
+        #conn.close()        
+        pass #raise Exception("checkorcreateRejectTable " + str(e))
+    cur.close() 
+    conn.close()
+    
+def jobAuditRecords(job_name,table_name,batch_id,status,error_desc,record_count,reject_record_cnt):
+    conn = pg8000.connect(
+        database=databasename, 
+        user=username, 
+        password= password,
+        host=postgreshostname,
+        port=config_port,
+        timeout=connect_timeout
+    )
+    try:
+        job_name = job_name.lower()
+        table_name = table_name.lower()
+        cur = conn.cursor()       
+        #cur.execute('select status from edw_audit.edw_audit_tbl where job_name = %s and table_name = %s and batch_id = %s ', (job_name,table_name,batch_id,))
+        #alreadyExist = cur.fetchone()[0]
+        if status == "STARTED" : #and alreadyExist != "STARTED" :
+            start_date = datetime.now()
+            end_date = None
+            cur.execute('insert into edw_audit.edw_audit_tbl (job_name,table_name,start_date,end_date,batch_id,status,error_desc,record_count,reject_record_cnt) values (%s,%s,%s,%s,%s,%s,%s,%s,%s)', (job_name,table_name,start_date,end_date,batch_id,status,error_desc,record_count,reject_record_cnt,))
+        else:
+            end_date = datetime.now()
+            cur.execute("update edw_audit.edw_audit_tbl set end_date = %s , status = %s, record_count = %s, reject_record_cnt=%s, error_desc = %s where job_name = %s and table_name = %s and batch_id = %s and status = 'STARTED'", (end_date,status,record_count,reject_record_cnt,error_desc,job_name,table_name,batch_id,))
+        conn.commit()
+    except Exception as e:
+        cur.close() 
+        conn.close()        
+        raise Exception("jobAuditRecords " + str(e))
+    cur.close() 
+    conn.close()
+
+
+def jobAuditNoRecords(job_name,table_name,batch_id,status,record_count,reject_record_cnt):
+    conn = pg8000.connect(
+        database=databasename, 
+        user=username, 
+        password= password,
+        host=postgreshostname,
+        port=config_port,
+        timeout=connect_timeout
+    )
+    try:
+        job_name = job_name.lower()
+        table_name = table_name.lower()
+        cur = conn.cursor()      
+        #print("Enter No Record")
+        cur.execute('insert into edw_audit.edw_audit_tbl (job_name,table_name,batch_id,status,record_count,reject_record_cnt,start_date,end_date) values (%s,%s,%s,%s,%s,%s,%s,%s)', (job_name,table_name,batch_id,status,record_count,reject_record_cnt,datetime.now(),datetime.now()))
+        conn.commit()
+    except Exception as e:
+        cur.close() 
+        conn.close()        
+        raise Exception("jobAuditNoRecords " + str(e))
+    cur.close() 
+    conn.close()
+    
+#####################################
+
+def DQChecksLength(row,dqName,dqValidation):
+	drow = row
+	err_desc = ""
+	check = False
+	if drow[dqName] is not None:
+		drow[dqName] = drow[dqName].encode('utf-8')
+    
+	if len(str(drow[dqName])) != dqValidation :
+		err_desc = dqName + " length is not equal to " +  str(dqValidation)
+		drow[ERROR_DESCRIPTION] = drow[ERROR_DESCRIPTION] + " , "  + err_desc
+		check = True
+	return drow,check
+
+########################################
+
+def DQChecksType(row,dqName,dqValidation):
+	drow = row
+	err_desc = ""
+	if drow[dqName] is not None:
+		drow[dqName] = drow[dqName].encode('utf-8')
+	check = False
+	if dqValidation == 'Integer' and not re.match("^[0-9 -]+$", drow[dqName]):
+		err_desc = dqName + " is not integer"
+		drow[ERROR_DESCRIPTION] = drow[ERROR_DESCRIPTION] + " , "  + err_desc
+		check = True
+	return drow,check                  
+
+##########################################
+					
+def DQChecksNull(row,dqName,dqValidation):
+	drow = row
+	err_desc = ""
+	check = False
+	if drow[dqName] is not None:
+		drow[dqName] = drow[dqName].encode('utf-8')
+        
+	#print("drow[dqName]=" + str(drow[dqName]))
+	if str(drow[dqName]) == 'None' or str(drow[dqName]).strip() == '':
+		err_desc = dqName + " is null"      #upd vsar as 1      
+		drow[ERROR_DESCRIPTION] = drow[ERROR_DESCRIPTION] + " , "  + err_desc   
+		check = True
+	return drow,check
+	
+############################################
+
+dimtbl = {}
+
+def RepresentsInt(s):
+    try: 
+        int(s)
+        return True
+    except ValueError:
+        return False
+    
+    
+def DQCheckIntegrity(row,dqName,dqValidation,dqIntegrityTables):
+	dqIntegrity = dqIntegrityTables.strip()
+	#print("dqIntegrity=" + str(dqIntegrity) + "dimtblkeys=" + str(dimtbl.keys()) + "dqName=" + str(dqName))    
+	drow = row
+	err_desc = ""
+	dqIntegrity = dqIntegrity.lower()
+	check = False
+	if dqIntegrity in dimtbl:
+		dimtbllist = dimtbl[dqIntegrity]
+		if drow[dqName] is not None:
+			drow[dqName] = drow[dqName].encode('utf-8')
+		if ((drow[dqName] is not None and not RepresentsInt(drow[dqName])) or (drow[dqName] is not None and RepresentsInt(drow[dqName]) and int(drow[dqName])!=0)) and str(drow[dqName]) not in dimtbllist:
+			#print("dqIntegrity=" + dqIntegrity + "drow[dqName]=" + str(drow[dqName]) + "dimtbl[dqIntegrity]=" + str(dimtbllist))
+			#print("dqIntegrity=" + dqIntegrity + "drow[dqName]=" + str(drow[dqName]) + "dqName=" + str(dqName))			
+			err_desc = dqName + " is not present in " + dqIntegrity      #upd vsar as 1      
+			drow[ERROR_DESCRIPTION] = drow[ERROR_DESCRIPTION] + " , "  + err_desc   
+			check = True
+	
+	return drow,check
+	
+################################################
+
+def DQChecks(dqjsonArray,tgtschema_names,row):
+	drow = row.asDict()
+	drow[ERROR_DESCRIPTION] = ''
+	# Filter python objects with list comprehensions
+	uniqueColumnNames = set()
+	for dq in dqjsonArray:
+		uniqueColumnNames.add(dq['NAME'].strip().lower())
+	#print("uniqueColumnNames=" + str(uniqueColumnNames) + "tgtschema_names=" + str(tgtschema_names))
+	for colName in uniqueColumnNames:
+		if len(colName.strip()) > 0  and colName in tgtschema_names:
+			dqItems = [x for x in dqjsonArray if x['NAME'].strip().lower() == colName]
+			nullcheck = False
+			lengthcheck = False
+			typecheck = False
+			for dq in dqItems :
+				if int(dq['DQTYPE']) == 0:
+					drow,nullcheck = DQChecksNull(drow,colName,dq['DQVALIDATION'])
+				if int(dq['DQTYPE']) == 1 and nullcheck == False:
+					drow,typecheck = DQChecksType(drow,colName,dq['DQVALIDATION'])
+				if int(dq['DQTYPE']) == 2 and typecheck == False and nullcheck == False:
+					drow,lengthcheck = DQChecksLength(drow,colName,dq['DQVALIDATION'])
+				if int(dq['DQTYPE']) == 3 and lengthcheck == False and typecheck == False and nullcheck == False:
+					drow,intgcheck = DQCheckIntegrity(drow,colName,dq['DQVALIDATION'],dq['INTEGRITYTABLES'])
+	if drow and str(drow[ERROR_DESCRIPTION]).strip() != '':
+		return Row(**drow)
+
+def GetLMSStageVarChar(targettable,tgtschema_names):
+    conn = pg8000.connect(
+        database=databasename, 
+        user=username, 
+        password= password,
+        host=postgreshostname,
+        port=config_port,
+        timeout=connect_timeout
+    )
+    tablesvarcharsschema = None
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM   information_schema.columns    WHERE  table_schema = 'lms_stage'   AND    table_name = %s" , (targettable.lower(),) )
+        
+        for row in cur:
+            if 'character varying' in str(row[7]) and str(row[3]) in tgtschema_names:
+                if tablesvarcharsschema is not None:
+                    tablesvarcharsschema = tablesvarcharsschema + "," + str(row[3]) + " varchar(" + str(row[8]) + ")"
+                else:
+                    tablesvarcharsschema = str(row[3]) + " varchar(" + str(row[8]) + ")"
+    except:
+        pass
+    cur.close() 
+    conn.close()   
+    
+    if tablesvarcharsschema is None:
+        tablesvarcharsschema = ''
+        
+    return tablesvarcharsschema
+
+def processTable(lines,tn,targettable):
+    errordesc = ''
+    maxbatchidint = 0
+    
+    try:
+        
+        datasourceSpark_orig = glueContext.read.format('com.databricks.spark.csv').option('quote', '"').option('escape', '"').options(header='true', inferschema='false').option("multiLine", 'true').load(sourcepath + tn + "/LOAD00000001.csv")#reading target table for schema
+        for col in datasourceSpark_orig.columns:
+            datasourceSpark_orig = datasourceSpark_orig.withColumnRenamed(col, col.lower())   
+    except Exception as e:
+        #print(JOB_NAME + " " + str(e))
+        lambda_client = boto3_client('lambda',region_name='ap-south-1')
+        payload = {'table_name': str(targettable.upper()),'sourcesystem': str(sourcesystem.upper())}
+        payload = json.dumps(payload)        
+        response_maxbatchidint = lambda_client.invoke(FunctionName="lmspostgresemptytable_n2p",InvocationType="RequestResponse",Payload=payload,LogType="Tail")
+        res_json = json.loads(response_maxbatchidint['Payload'].read().decode("utf-8"))
+    	truncateTable(schema + "." + targettable.lower())           
+        jobAuditNoRecords(JOB_NAME,tn,res_json["batchid_Oracle"],"SUCCESS",0,0)
+        return
+
+    try:
+    	maxbatchid = datasourceSpark_orig.agg({"BATCH_ID": "max"}).collect()[0]
+    	maxbatchidint = int(float(maxbatchid["max(BATCH_ID)"]))
+    	present = False
+        
+    	for row in csv.DictReader(lines):
+    		if  str(tn.strip()) == str(row['TABLENAME'].strip()):
+    			present = True
+    			break
+
+    	jobAuditRecords(JOB_NAME,tn,maxbatchidint,"STARTED",errordesc,None,None)
+        
+    	truncateTable(schema + "." + targettable.lower())
+        
+    	checkorcreateRejectTable(schema , targettable.lower())
+
+        tgtschema = None    	
+    	try:
+    		tgtdynframe = glueContext.create_dynamic_frame.from_options(connection_type = 'postgresql', connection_options = {"url" : postgresjdbcurl, "user": username, "password": password, "database" : "postgres","dbtable": schema+"."+targettable.lower()}, format=None)
+    		tgtschema = tgtdynframe.toDF().schema
+    	except Exception as e:         
+            raise Exception(str(e))
+            
+    	try:
+    		rej_tgtdynframe = glueContext.create_dynamic_frame.from_options(connection_type = 'postgresql', connection_options = {"url" : postgresjdbcurl, "user": username, "password": password, "database" : "postgres","dbtable": schema+".rej_"+ targettable.lower()}, format=None)
+    		rej_tgtschema = rej_tgtdynframe.toDF().schema
+    	except Exception as e:         
+            raise Exception(str(e))            
+          
+    	datasourceSpark = datasourceSpark_orig.select(tgtschema.names) 			
+
+    	RejectedDF = None          
+    	if present:
+    		dqjsonArray = []
+    		for row in csv.DictReader(lines):
+    		    if  tn.strip().lower() == row['TABLENAME'].strip().lower():
+    			    del row["TABLENAME"]
+    			    dqjsonArray.append(row)
+            
+    		#print("dqjsonArray=" + str(dqjsonArray))
+    		dqIntegrity = ''
+    		dimtbltempspark = None
+    		for dqArr in dqjsonArray:
+    		    if dqArr['NAME'].lower() in tgtschema.names and int(dqArr['DQTYPE']) == 3:
+        		    if dqArr['INTEGRITYTABLES'] is not None and len(str(dqArr['INTEGRITYTABLES']).strip())>0:
+        			    dqIntegrity = dqArr['INTEGRITYTABLES'].strip()
+        			    dqIntegrity = dqIntegrity.lower()
+        			    martschema = str(dqArr['TARGET_SCHEMA']).lower().strip()
+        			    #if martschema is not None:
+        			        #print("martschema=" + martschema)    
+            		    if martschema is not None and len(martschema.strip())>0 and len(dqIntegrity.strip())>0 and not dqIntegrity.strip() in dimtbl:
+            			    try:
+            			        dimtbltemp = glueContext.create_dynamic_frame.from_options(connection_type = 'postgresql', connection_options = {"url" : postgresjdbcurl, "user": username, "password": password, "database" : "postgres","dbtable": martschema + "." + dqIntegrity }, format=None)
+            			        dimtbltempspark = dimtbltemp.toDF()
+            			    except Exception as e:        
+            			        raise Exception(str(e))
+                                
+            			    try:
+            			        intg_tgtdynframe = glueContext.create_dynamic_frame.from_options(connection_type = 'postgresql', connection_options = {"url" : postgresjdbcurl, "user": username, "password": password, "database" : "postgres","dbtable": martschema + "." + dqIntegrity}, format=None)
+            			        tgtschemaIntr = intg_tgtdynframe.toDF().schema
+            			    except Exception as e:         
+            			        raise Exception(str(e))                                
+                                
+            			    #dimtbltemp.show(2)
+            			    if dqArr['TARGETCOLNAME'].lower() in tgtschemaIntr.names:
+            			        #print("dqArr['TARGETCOLNAME'].lower()=" + str(dqArr['TARGETCOLNAME'].lower()) )
+            			        ingt_tgtschemadict = tgtschemaIntr.__dict__
+            			        for stfd in ingt_tgtschemadict['fields']:
+            			            intg_stfddict = stfd.__dict__   
+            			            if str(intg_stfddict['name']).lower().strip() == dqArr['NAME'].lower().strip():                                    
+        		    		    		dimtbltempspark = dimtbltempspark.withColumn(str(dqArr['TARGETCOLNAME'].lower()), dimtbltempspark[str(dqArr['TARGETCOLNAME'].lower())].cast(intg_stfddict['dataType']))                            
+            			        dimtbl_dqIntegrity = dimtbltempspark.select(dqArr['TARGETCOLNAME'].lower()).rdd.flatMap(lambda x: x).collect()
+            			        dimtbl[dqIntegrity] = [ str(x) for x in dimtbl_dqIntegrity ]
+            
+    		rejectedRdd = datasourceSpark.rdd.map(lambda x: DQChecks(dqjsonArray,tgtschema.names,x)).filter(lambda x: x)
+                
+    		
+    		newSchema = copy.deepcopy(datasourceSpark.schema)   
+    		newSchema = newSchema.add(ERROR_DESCRIPTION, StringType(), True)
+    		RejectedDF = None
+    		PassedDF = datasourceSpark     
+    		rejectedRdd_cnt = rejectedRdd.count()
+    		if rejectedRdd_cnt>0:      
+
+    			try:
+    				RejectedDF = glueContext.createDataFrame(rejectedRdd, newSchema)                                   
+    				#writing error records
+    				RejectedDF.repartition(1).write.mode('overwrite').csv(targetpath + targettable +"/rejectedrecords",header = 'true')#Extracting clean records by subtracting error records from source
+    			except Exception as e:        
+    				raise Exception(str(e))
+            
+    			RejectedDF = RejectedDF.drop(ERROR_DESCRIPTION)
+    			PassedDF = datasourceSpark.subtract(RejectedDF)##Type casting unicode to respective datatype
+    		tgtschemadict = tgtschema.__dict__          
+    		for stfd in tgtschemadict['fields']:
+    			stfddict = stfd.__dict__ 			
+    			PassedDF = PassedDF.withColumn(str(stfddict['name']), PassedDF[str(stfddict['name'])].cast(stfddict['dataType']))
+    	else:  
+    		tgtschemadict = tgtschema.__dict__	
+    		for stfd in tgtschemadict['fields']:
+    			stfddict = stfd.__dict__
+    			datasourceSpark = datasourceSpark.withColumn(str(stfddict['name']), datasourceSpark[str(stfddict['name'])].cast(stfddict['dataType']))#writing clean records to csv in S3
+    		PassedDF = datasourceSpark
+    		
+    	#writing clean records to csv in S3
+    	PassedDF.repartition(1).write.mode('overwrite').csv(targetpath + targettable + "/passedrecords",header = 'true')
+    	#writing clean records to Aurora Postgre Staging
+    	PassedDF = glueContext.createDataFrame(PassedDF.rdd, tgtschema)
+    	connectionDetails = glueContext.extract_jdbc_conf('BHFL-N2P-AURORAPOSTGRES-TG', None)
+
+    	database = 'postgres'
+    	mode = 'append'
+    	url = connectionDetails['url'] + '/' + database
+    	table = schema + "." + targettable.lower()
+    	properties = {"user": connectionDetails['user'], "password": connectionDetails['password'], "driver": "org.postgresql.Driver"}     
+
+    	targetschema = GetLMSStageVarChar(targettable.lower(),tgtschema.names)
+    	PassedDF.write.format('com.databricks.spark.csv').option('quote', '"').option('escape', '"').option("createTableColumnTypes",targetschema).jdbc(url=url, table=table, mode=mode, properties=properties)
+        
+    	reject_record_count = 0
+    	if RejectedDF is not None:
+            reject_record_count = RejectedDF.count()
+
+        print("reject_record_count=" + str(reject_record_count))
+
+    	if reject_record_count > 0:
+        	#writing clean records to Aurora Postgre Staging
+        	RejectedDF = glueContext.createDataFrame(rejectedRdd, newSchema)
+        	RejectedDF_2 = RejectedDF.select(rej_tgtschema.names) 
+    		rej_tgtschemadict = rej_tgtschema.__dict__	
+    		for stfd in rej_tgtschemadict['fields']:
+    			stfddict = stfd.__dict__
+    			print(str(stfddict['name']) + "  " + str(stfddict['dataType']) )
+    			RejectedDF_2 = RejectedDF_2.withColumn(str(stfddict['name']), RejectedDF_2[str(stfddict['name'])].cast(stfddict['dataType']))#writing clean records to csv in S3
+            
+        	connectionDetails = glueContext.extract_jdbc_conf('BHFL-N2P-AURORAPOSTGRES-TG', None)
+
+        	database = 'postgres'
+        	mode = 'append'
+        	url = connectionDetails['url'] + '/' + database
+        	table = schema + ".rej_" + targettable.lower()
+        	properties = {"user": connectionDetails['user'], "password": connectionDetails['password'], "driver": "org.postgresql.Driver"}      
+        	RejectedDF_2.write.format('com.databricks.spark.csv').option('quote', '"').option('escape', '"').jdbc(url=url, table=table, mode=mode, properties=properties)
+
+        	#print("RejectedDF=")
+        	#RejectedDF.show(2)
+
+    	jobAuditRecords(JOB_NAME,tn,maxbatchidint,"SUCCESS",errordesc,PassedDF.count(),reject_record_count)
+            
+    except Exception as e:
+        #exc_type, exc_obj, exc_tb = sys.exc_info()
+        #print("errordesc1=",exc_type, "line no" , exc_tb.tb_lineno)        
+        errordesc = str(e)
+        print("errordesc=" +str(errordesc))
+        jobAuditRecords(JOB_NAME,tn,maxbatchidint,"FAILED",str(errordesc)[:999],None,None)
+    
+
+#Reading tableName file for check
+s3 = boto3.resource('s3')
+obj = s3.Object(bucket, configpath)
+lines= obj.get()['Body'].read().decode("utf-8").splitlines()
+tablename = []
+for row in csv.DictReader(lines):
+	if row["TABLETYPE"] == 'FACT' and row["SOURCESYSTEM"] == 'LMS':
+		del row["TABLETYPE"]
+		del row["SOURCESYSTEM"]
+		tablename.append(row)
+
+s3 = boto3.resource('s3')
+obj = s3.Object(bucket, configDQpath)
+lines= obj.get()['Body'].read().decode("utf-8").splitlines()
+	
+#truncate audit table
+
+for d in tablename:
+	processTable(lines,d['SOURCETABLE'],d['TARGETTABLE'])
+
+job.commit()
