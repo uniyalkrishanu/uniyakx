@@ -1,0 +1,1106 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.types import *
+import json
+import boto3
+from pyspark.sql.types import Row
+import re
+from awsglue import DynamicFrame
+from pyspark.sql.types import *
+import csv
+from datetime import datetime
+import copy
+from boto3  import client as boto3_client
+from datetime import datetime, timedelta
+import dateutil
+import os
+import math
+import uuid
+from pyspark.sql.functions import concat,udf,when,lit,col,to_date,date_format,lpad,max as max_ , rand,explode,sha2, concat_ws,size,count,regexp_replace
+from botocore.vendored import requests
+from botocore.exceptions import ClientError
+import random
+import time
+from pytz import timezone
+
+jobfrequency = 6*24
+## @params: [JOB_NAME]
+args = getResolvedOptions(sys.argv, ['JOB_NAME','processing_pipeline_params_namespace','url_params_namespace'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+JOB_NAME = args['JOB_NAME']
+
+processing_pipeline_params_namespace = args['processing_pipeline_params_namespace']
+url_params_namespace = args['url_params_namespace']
+
+
+#CONFIGURATIONS
+ssm = boto3.client('ssm', region_name="ap-south-1")
+s3BucketName = ssm.get_parameter(Name=processing_pipeline_params_namespace + '.sourcebucket')['Parameter']['Value']
+targetbucket = ssm.get_parameter(Name=processing_pipeline_params_namespace + '.targetbucket')['Parameter']['Value']
+auroralambda = ssm.get_parameter(Name=processing_pipeline_params_namespace + '.aurora-lambda')['Parameter']['Value']
+
+sourcepath = "s3://" + s3BucketName + "/"
+targetpath = "s3://" + targetbucket + "/"
+
+
+ERROR_DESCRIPTION = 'error_description'
+sourcestaging = "sourcestaging"
+targetstaging = "targetstaging"
+schemastaging = "schema"
+
+#martschema = "lms_mart"
+
+s3 = boto3.resource('s3', region_name="ap-south-1")
+
+glueContext.clearCache()
+
+def call_aurora_batch_metadata_access(payload):
+    try:
+        lambda_client = boto3_client('lambda',region_name='ap-south-1')
+        payload = json.dumps(payload)
+        response= lambda_client.invoke(FunctionName=auroralambda,InvocationType="RequestResponse",Payload=payload,LogType="Tail")
+        res_json = json.loads(response['Payload'].read().decode("utf-8"))
+    except Exception as e: 
+        raise Exception("call_aurora_batch_metadata_access " + str(e))    
+    return res_json
+
+def jobBatchMetadataRecords(job_name,entity_name,batch_id,status,error_desc,record_count,reject_record_cnt):
+    payload = {'requesttype': 'jobbatchmetadatarecords','job_name':job_name,'entity_name': entity_name,'batch_id' : batch_id,'status': status,'error_desc' : error_desc,'record_count' : record_count,'reject_record_cnt': reject_record_cnt}
+    res_json = call_aurora_batch_metadata_access(payload)
+    if res_json is None:
+        raise Exception("jobBatchMetadataRecords failed")   
+    elif res_json["status"] == "failed":
+        raise Exception("jobBatchMetadataRecords failed" + res_json["error"]) 
+        
+    return res_json["status"]
+    
+
+def getstagingbatchid(job_name,entity_name):
+    payload = {'requesttype': 'getstagingbatchid','job_name':job_name,'entity_name': entity_name}
+    res_json = call_aurora_batch_metadata_access(payload)        
+    if res_json is None:
+        raise Exception("getstagingbatchid failed")   
+    elif res_json["status"] == "failed":
+        raise Exception("getstagingbatchid failed" + res_json["error"]) 
+        
+    return res_json["batchid"]
+
+def lastsuccesstimediff(job_name,entity_name):
+    payload = {'requesttype': 'lastsuccesstimediff','job_name':job_name,'entity_name': entity_name}
+    res_json = call_aurora_batch_metadata_access(payload)     
+    if res_json is None:
+        raise Exception("lastsuccesstimediff failed")   
+    elif res_json["status"] == "failed":
+        raise Exception("lastsuccesstimediff failed" + res_json["error"]) 
+        
+    return res_json["lastsuccesstimediff"]
+    
+def copy_latest_raw_data_for_batch(s3BucketName,sourceentity,sourcestaging,jobfrequency):
+    s3 = boto3.resource('s3')  
+    s3_bucket = s3.Bucket(s3BucketName) 
+    for object in s3_bucket.objects.filter(Prefix=(sourcestaging + "/" + sourceentity)):
+        s3.Object(s3BucketName, object.key).delete()   
+        
+    items = [item for item in s3_bucket.objects.filter(Prefix=sourceentity)]  
+    now = datetime.now(timezone('Asia/Kolkata'))
+    
+    if jobfrequency > 0:
+        td = timedelta(hours=jobfrequency)  
+        last_n_hours_keys = [item.key for item in items if now - item.last_modified < td]
+    else:
+        last_n_hours_keys = [item.key for item in items] 
+        
+    #print(last_n_hours_keys)
+
+    for srcKey in last_n_hours_keys:
+        if not srcKey.endswith('/'):
+            destFileKey = sourcestaging + '/' + srcKey
+            print("destFileKey=" + destFileKey) 
+            copySource = s3BucketName + '/' + srcKey
+            s3.Object(s3BucketName, destFileKey).copy_from(CopySource=copySource)       
+
+def copy_latest_staging_data_for_batch(s3BucketName,sourcefolder):
+    s3 = boto3.resource('s3')  
+    s3_bucket = s3.Bucket(s3BucketName)             
+
+    for object in s3_bucket.objects.filter(Prefix=(sourcefolder)):
+        srcKey = object.key
+        if not srcKey.endswith('/'):
+            print(srcKey)
+            destFileKey = os.path.join(*(srcKey.split("/")[1:]))
+            copySource = s3BucketName + '/' + srcKey
+            s3.Object(s3BucketName, destFileKey).copy_from(CopySource=copySource)   
+        #s3.Object(s3BucketName, srcKey).delete()    
+
+def delete_latest_staging_data_for_batch(s3BucketName,sourcefolder):
+    s3 = boto3.resource('s3')  
+    s3_bucket = s3.Bucket(s3BucketName)             
+
+    for object in s3_bucket.objects.filter(Prefix=(sourcefolder)):
+        srcKey = object.key
+        s3.Object(s3BucketName, srcKey).delete()  
+        
+def load_params():
+    """Load parameters from SSM Parameter Store.
+    :namespace: The application namespace.
+    :env: The current application environment.
+    :return: The config loaded from Parameter Store.
+    """
+    params_namespace = processing_pipeline_params_namespace.split("/")
+    
+    path = "/" + params_namespace[1] + "/" + params_namespace[2] + "/"
+    ssm = boto3.client("ssm", region_name="ap-south-1")
+    more = None
+    args = {"Path": path, "Recursive": True}
+    entitynames = {}
+    while more is not False:
+        if more:
+            args["NextToken"] = more
+        params = ssm.get_parameters_by_path(**args)
+        for param in params["Parameters"]:
+            key = param["Name"].split("/")[3]
+            if "processing_pipeline.entityconfig" in key :
+                if param["Name"].split(".")[2].strip() == 'hm':
+                    entitynames[param["Name"].split(".")[3]] = param["Value"]
+        more = params.get("NextToken", False)
+        
+    return entitynames  
+
+def generate_unique_number(unique_numbers,totnumber):
+    for _ in range(totnumber):
+        chars = "1234567890"
+        while True:
+            value = "".join(random.choice(chars) for _ in range(7))
+            if value not in unique_numbers:
+                unique_numbers.add(value)
+                break
+    
+    return unique_numbers
+
+def guid():
+    t = int( time.time() * 1000.0 )
+    random.seed( ((t & 0xff000000) >> 24) + ((t & 0x00ff0000) >>  8) + ((t & 0x0000ff00) <<  8) + ((t & 0x000000ff) << 24) )
+    chars = "1234567890"
+    value = "".join(random.choice(chars) for _ in range(7))
+    data = str(datetime.now(timezone('Asia/Kolkata')).strftime('%Y%m%d'))  + str(value)
+    
+    return data
+
+def remove_duplicate_extractid_from_df(suspense_target_df,extractids,tseed):
+        
+    extractids = [str(row['FINANCE_EXTRACT_ID']) for row in extractids]
+    
+    suspense_target_df_latest2=suspense_target_df.where(col("FINANCE_EXTRACT_ID").isin(extractids))
+    
+    if len(suspense_target_df_latest2.head(1)) > 0:
+        
+        suspense_target_df_latest1=suspense_target_df.where(col("FINANCE_EXTRACT_ID").isin(extractids) == False)
+                     
+        suspense_target_df_latest2 = suspense_target_df_latest2.withColumn('randseq',  rand(seed=tseed)*10000000)
+        
+        suspense_target_df_latest2 = suspense_target_df_latest2.withColumn('FINANCE_EXTRACT_ID',concat(lit(datetime.now(timezone('Asia/Kolkata')).strftime('%Y%m%d')),  lpad(suspense_target_df_latest2['randseq'].cast(IntegerType()),7,'0')) ) 
+
+        suspense_target_df_latest2.cache()
+        
+        suspense_target_df_latest2 = suspense_target_df_latest2.drop(*["randseq"])    
+        
+        suspense_target_df_latest2 = suspense_target_df_latest2.select(suspense_target_df_latest1.columns)
+        
+        suspense_target_df = suspense_target_df_latest1.union(suspense_target_df_latest2) 
+        
+    return suspense_target_df
+
+def all_types_tostring(dfschemajson):
+    
+    dfschemajson = dfschemajson.replace('"type":"binary"','"type":"string"')
+    dfschemajson = dfschemajson.replace('"type":"boolean"','"type":"string"')
+    dfschemajson = dfschemajson.replace('"type":"byte"','"type":"string"')
+    dfschemajson = dfschemajson.replace('"type":"double"','"type":"string"')
+    dfschemajson = dfschemajson.replace('"type":"integer"','"type":"string"')
+    dfschemajson = dfschemajson.replace('"type":"long"','"type":"string"')
+    dfschemajson = dfschemajson.replace('"type":"decimal"','"type":"string"')
+    dfschemajson = dfschemajson.replace('"type":"float"','"type":"string"')
+    dfschemajson = dfschemajson.replace('"type":"short"','"type":"string"')    
+    dfschemajson = dfschemajson.replace('"type":"unknown"','"type":"string"')
+    dfschemajson = dfschemajson.replace('"type":"date"','"type":"string"')
+    dfschemajson = dfschemajson.replace('"type":"timestamp"','"type":"string"')
+    dfschemajson = dfschemajson.replace('"type":"null"','"type":"string"')        
+        
+    return dfschemajson
+
+def resolvechoices(dynamicdf):
+    
+    dynamicdfCopy = dynamicdf
+    try:
+        dynamicdf=ResolveChoice.apply(dynamicdf, choice = "cast:string") 
+        dfschema = dynamicdf.toDF().schema.json()
+        dynamicdfCopy = dynamicdf
+    except:
+        dynamicdf = dynamicdfCopy
+        pass
+    try:
+        dynamicdf=ResolveChoice.apply(dynamicdf, choice = "cast:double") 
+        dfschema = dynamicdf.toDF().schema.json()
+        dynamicdfCopy = dynamicdf
+    except:
+        dynamicdf = dynamicdfCopy
+        pass  
+    try:
+        dynamicdf=ResolveChoice.apply(dynamicdf, choice = "cast:long") 
+        dfschema = dynamicdf.toDF().schema.json()
+        dynamicdfCopy = dynamicdf
+    except:
+        dynamicdf = dynamicdfCopy
+        pass      
+    try:
+        dynamicdf=ResolveChoice.apply(dynamicdf, choice = "cast:int") 
+        dfschema = dynamicdf.toDF().schema.json()
+        dynamicdfCopy = dynamicdf
+    except:
+        dynamicdf = dynamicdfCopy
+        pass   
+    try:
+        dynamicdf=ResolveChoice.apply(dynamicdf, choice = "cast:boolean") 
+        dfschema = dynamicdf.toDF().schema.json()
+        dynamicdfCopy = dynamicdf
+    except:
+        dynamicdf = dynamicdfCopy
+        pass          
+    return dynamicdf
+
+def entityadapters(glueContext,datasourceDynamicOrig,targetentity,jobfrequency):   
+    
+    t = int( time.time() * 1000.0 )
+    tseed =  ((t & 0xff000000) >> 24) + ((t & 0x00ff0000) >>  8) + ((t & 0x0000ff00) <<  8) + ((t & 0x000000ff) << 24)
+    
+    try:
+        if targetentity.lower()=="suspense":
+            
+            #relatedentities = {"hm-refund":"refund","hm-policy":"policy","hm-payment":"payment"} 
+            
+            relatedentities = {"hm-policy":"policy","hm-payment":"payment","hm-party":"party","hm-refund":"refund","hm-policycancellation":"policycancellation","hm-servicerequest":"servicerequest","hm-reinstatement": "reinstatement"} 
+            
+            #anyCancelled = True
+            #anyRefund = True
+            
+            datasourceDynamicRelatedentities = {}
+            for ent in relatedentities:
+                print("relatedentities=" + ent)
+                try:
+                    datasourceDynamicRelatedentities[relatedentities[ent]] = glueContext.create_dynamic_frame_from_options("s3", {'paths': [sourcepath + ent ], 'recurse':True, 'groupFiles': 'inPartition', "mergeSchema" : "true"}, format="json") 
+                    datasourceDynamicRelatedentities[relatedentities[ent]] = resolvechoices(datasourceDynamicRelatedentities[relatedentities[ent]])
+                except Exception as e:
+                    errordesc = str(e)
+                    print("relatedentitieserror=" + str(errordesc) + "   " + relatedentities[ent].lower())                      
+                        																												 
+                if relatedentities[ent].lower() == 'policy' or relatedentities[ent].lower() == 'reinstatement':
+                    #remove duplicates and get latest
+                    policydf = datasourceDynamicRelatedentities[relatedentities[ent]].toDF()                    
+                    policydf = policydf.withColumn("created_at",regexp_replace(col("created_at"),"\\+0530","\\+05:30").cast("timestamp"))                    
+                    policydf2 = policydf.select(policydf.columns).withColumn("created_at",regexp_replace(col("created_at"),"\\+0530","\\+05:30").cast("timestamp")).filter(policydf['created_at'].isNotNull()).groupBy("policyNumber").agg(max_("created_at"))                   
+                    policydf2 = policydf2.withColumnRenamed("max(created_at)","created_at1").withColumnRenamed("policyNumber","policyNumber1")                    
+                    policydf = policydf.join(policydf2, (policydf.policyNumber == policydf2.policyNumber1) & (policydf.created_at == policydf2.created_at1))                    
+                    policydf = policydf.drop(*["policyNumber1", "created_at1"])   
+
+                    if relatedentities[ent].lower() == 'policy':
+                        coveragecodesdf = policydf.select(explode(policydf["coverages"])).select("col.code","col.coverageClass").repartition(1).drop_duplicates()   
+                        coveragecodesdf_dynamic=DynamicFrame.fromDF(coveragecodesdf, glueContext, "coveragecodes_dynamicframe")  
+                        coveragecodesdf_dynamic.toDF().createOrReplaceTempView("coveragecodes")
+                    
+                    datasourceDynamicRelatedentities[relatedentities[ent]] = DynamicFrame.fromDF(policydf, glueContext, ent + "_dynamicframe")                
+
+                elif relatedentities[ent].lower() == 'payment' or relatedentities[ent].lower() == 'refund' or relatedentities[ent].lower() == 'party' or (relatedentities[ent].lower() == 'policycancellation'):
+                    primaryid = "id"
+                    if relatedentities[ent].lower() == 'payment':
+                    	primaryid = "payment.id"
+                    #remove duplicates and get latest
+                    dummydf = datasourceDynamicRelatedentities[relatedentities[ent]].toDF()                    
+                    dummydf = dummydf.withColumn("created_at",regexp_replace(col("created_at"),"\\+0530","\\+05:30").cast("timestamp"))                    
+                    dummydf2 = dummydf.select(dummydf.columns).withColumn("created_at",regexp_replace(col("created_at"),"\\+0530","\\+05:30").cast("timestamp")).filter(dummydf['created_at'].isNotNull()).groupBy(primaryid).agg(max_("created_at"))                   
+                    dummydf2 = dummydf2.withColumnRenamed("max(created_at)","created_at1").withColumnRenamed("id","id1")                    
+                    if relatedentities[ent].lower() == 'payment':
+                    	dummydf = dummydf.join(dummydf2, (dummydf.payment.id == dummydf2.id1) & (dummydf.created_at == dummydf2.created_at1))                    
+                    else:
+                    	dummydf = dummydf.join(dummydf2, (dummydf.id == dummydf2.id1) & (dummydf.created_at == dummydf2.created_at1))                     
+                    dummydf = dummydf.drop(*["id1", "created_at1"])      
+                    if relatedentities[ent].lower() == 'policycancellation' and "freeLookQuotationResponse" in dummydf.columns:
+                    	tempdf1 = dummydf.select(["freeLookQuotationResponse.*","id"])                    
+                    	tempdf = dummydf.drop(*["freeLookQuotationResponse"])                    
+                    	dummydf = tempdf1.join(tempdf, tempdf1.id == tempdf.id, 'inner').drop(tempdf.id) 
+                        
+                    #dummydf = dummydf.withColumn("created_at",col("created_at").cast('date').cast("string"))
+                    datasourceDynamicRelatedentities[relatedentities[ent]] = DynamicFrame.fromDF(dummydf, glueContext, ent + "_dynamicframe")                
+
+                elif relatedentities[ent].lower() == 'servicerequest':
+                    #remove duplicates and get latest
+                    servicerequestdf = datasourceDynamicRelatedentities[relatedentities[ent]].toDF()                    
+                    servicerequestdf = servicerequestdf.withColumn("created_at",regexp_replace(col("created_at"),"\\+0530","\\+05:30").cast("timestamp"))                    
+                    servicerequestdf2 = servicerequestdf.select(servicerequestdf.columns).withColumn("created_at",regexp_replace(col("created_at"),"\\+0530","\\+05:30").cast("timestamp")).filter(servicerequestdf['created_at'].isNotNull()).groupBy("requestId").agg(max_("created_at"))                   
+                    servicerequestdf2 = servicerequestdf2.withColumnRenamed("max(created_at)","created_at1").withColumnRenamed("requestId","requestId1")                    
+                    servicerequestdf = servicerequestdf.join(servicerequestdf2, (servicerequestdf.requestId == servicerequestdf2.requestId1) & (servicerequestdf.created_at == servicerequestdf2.created_at1))                    
+                    servicerequestdf = servicerequestdf.drop(*["requestId1", "created_at1"])   
+                    servicerequestdf = servicerequestdf.withColumn("created_at",col("created_at").cast("string")) 
+                    datasourceDynamicRelatedentities[relatedentities[ent]] = DynamicFrame.fromDF(servicerequestdf, glueContext, ent + "_dynamicframe")              
+
+                datasourceDynamicRelatedentities[relatedentities[ent]].toDF().createOrReplaceTempView(relatedentities[ent])
+
+            
+            #remove duplicates and get latest
+            datasourceDynamicOrig = resolvechoices(datasourceDynamicOrig)            
+            suspensedf = datasourceDynamicOrig.toDF() 
+            suspensedf = suspensedf.withColumn("created_at",regexp_replace(col("created_at"),"\\+0530","\\+05:30").cast("timestamp"))
+            suspensedf2 = suspensedf.select(suspensedf.columns).withColumn("created_at",regexp_replace(col("created_at"),"\\+0530","\\+05:30").cast("timestamp")).filter(suspensedf['created_at'].isNotNull()).groupBy("id").agg(max_("created_at"))  
+            suspensedf2 = suspensedf2.withColumnRenamed("max(created_at)","created_at1").withColumnRenamed("id","id1")  
+            suspensedf = suspensedf.join(suspensedf2, (suspensedf.id == suspensedf2.id1) & (suspensedf.created_at == suspensedf2.created_at1)) 
+            suspensedf = suspensedf.drop(*["id1", "created_at1"]) 
+
+            #start don't replay suspense if extract id already generated
+            try:
+            	sourceentity = "hm-financeadapter-activity"
+            
+            	financeadapter_activity_dynamicframe = glueContext.create_dynamic_frame_from_options("s3", {'paths': [sourcepath + sourceentity ], 'recurse':True, 'groupFiles': 'inPartition', "mergeSchema" : "true"}, format="json")
+                
+            	financeadapter_activity_dynamicframe = resolvechoices(financeadapter_activity_dynamicframe)
+                
+            	financeadapter_activity_dynamicframe.toDF().createOrReplaceTempView("financeadapter_activity")
+                
+            	suspense_dynamicframe_latest = glueContext.spark_session.sql("select distinct SUPENSE_ID from financeadapter_activity").drop_duplicates()
+                
+            	SUPENSE_IDS = suspense_dynamicframe_latest.select("SUPENSE_ID").repartition(1).drop_duplicates().collect()
+                
+            	SUPENSE_IDS = [str(row['SUPENSE_ID']) for row in SUPENSE_IDS]
+
+            	#handle missed suspenses for last 2 days
+            	fromdate = datetime.strftime(datetime.now(timezone('Asia/Kolkata')) - timedelta(days=(int(jobfrequency/24)+2)), '%Y-%m-%d')
+                			
+            	#suspensedf_missed = glueContext.spark_session.sql("select s.* from suspense s  LEFT OUTER JOIN financeadapter_activity fa ON (fa.SUPENSE_ID = cast(s.id.int as string)) WHERE fa.SUPENSE_ID IS null and ((s.suspenseType='NB' and s.transactionType='CREDIT' and s.reason='NEW_BUSINESS') or (s.suspenseType='NB' and s.transactionType='DEBIT' and s.reason='APPLIED') or (s.suspenseType='RENEWAL' and s.transactionType='CREDIT' and s.reason='RENEWAL') or (s.suspenseType='NB' and s.transactionType='CREDIT' and s.reason='COUNTER_OFFER') or (s.suspenseType='RENEWAL' and s.transactionType='DEBIT' and s.reason='APPLIED') or (s.suspenseType='PAYOUT' and s.transactionType='DEBIT' and s.reason='REJECT') or (s.suspenseType='PAYOUT' and s.transactionType='DEBIT' and s.reason='FREELOOK') or (s.suspenseType='PAYOUT' and s.transactionType='DEBIT' and s.reason='EXCESS_PREMIUM')) and s.created_at > '" + fromdate + "' ").drop_duplicates()
+
+            	suspensedf_missed = glueContext.spark_session.sql("select s.* from suspense s  LEFT OUTER JOIN financeadapter_activity fa ON (fa.SUPENSE_ID = cast(s.id.int as string)) WHERE fa.SUPENSE_ID IS null and ((s.suspenseType='NB' and s.transactionType='CREDIT' and s.reason='NEW_BUSINESS') or (s.suspenseType='NB' and s.transactionType='DEBIT' and s.reason='APPLIED') or (s.suspenseType='RENEWAL' and s.transactionType='CREDIT' and s.reason='RENEWAL') or (s.suspenseType='NB' and s.transactionType='CREDIT' and s.reason='COUNTER_OFFER') or (s.suspenseType='RENEWAL' and s.transactionType='DEBIT' and s.reason='APPLIED') or (s.suspenseType='PAYOUT' and s.transactionType='DEBIT' and s.reason='REJECT') or (s.suspenseType='PAYOUT' and s.transactionType='DEBIT' and s.reason='FREELOOK') or (s.suspenseType='PAYOUT' and s.transactionType='DEBIT' and s.reason='EXCESS_PREMIUM') or (s.suspenseType='REINSTATEMENT' and s.transactionType='CREDIT' and s.reason='POLICY_LAPSED') or (s.suspenseType='REINSTATEMENT' and s.transactionType='DEBIT' and s.reason='APPLIED')) and s.created_at > '" + fromdate + "' ").drop_duplicates()
+                
+            	suspensedf_missed = suspensedf_missed.select(suspensedf.columns)                
+                
+            	suspensedf = suspensedf.union(suspensedf_missed)
+                
+            	suspensedf = suspensedf.drop_duplicates()   
+                
+            	suspensedf = suspensedf.filter(col("id").isin(['66686','66688','66687','66692','66689','66728','66691','66727']))               
+                               	
+            except:
+            	pass                 
+            #end don't replay suspense if extract id already generated
+            
+            #suspensedf = suspensedf.withColumn("created_at",col("created_at").cast('date').cast("string"))
+            datasourceDynamicOrig = DynamicFrame.fromDF(suspensedf, glueContext, targetentity + "_dynamicframe")  
+            datasourceDynamicOrig.toDF().createOrReplaceTempView(targetentity)
+
+            sqlQuery = "select s.suspenseType AS suspenseType,s.transactionType AS transactionType, s.reason AS reason, s.policyNumber AS POLICY_NUMBER,s.createdOn AS TRANSACTION_DATE, URBAN_RURAL_SOCIAL, PRODUCT_CODE, PREMIUM_TYPE, s.suspenseAmount AS AMOUNT,TRANSACTION_ID, CASE WHEN s.payoutid IS NULL THEN PAYMENT_MODE ELSE PAYMENT_MODE1 END AS PAYMENT_MODE,SOURCING_CHANNEL, SOURCING_SUB_CHANNEL, AGENT_CODE, '' AS AGENT_STATUS, '' AS COMMISIONABLE, SOURCING_BRANCH_CODE, CASE WHEN RECEIPTING_BRANCH_CODE IS NOT NULL THEN RECEIPTING_BRANCH_CODE ELSE '100'  END AS RECEIPTING_BRANCH_CODE, LOS, POS, '' AS CUST_GST_NO, s.invoiceNumber AS INVOICE_NO,'' AS REF_INVOICE_NO, CASE WHEN s.payoutid IS NULL THEN PAYMENT_TYPE ELSE PAYMENT_TYPE1 END AS  PAYMENT_TYPE, CUSTOMER_NAME,'' AS SUPPLIER,CASE WHEN s.payoutid IS NULL THEN '' ELSE TRANSACTION_ID1 END AS VOUCHER_NO,CASE WHEN s.payoutid IS NULL THEN '' ELSE CHECK_NO1 END AS CHECK_NO, '' AS SUPPLIER_CODE,s.id AS SUPENSE_ID,CASE WHEN s.paymentId IS NOT NULL THEN s.paymentId ELSE '' END AS PAYIN_ID,CASE WHEN s.payoutid IS NOT NULL THEN s.payoutid ELSE '' END AS PAY_OUT, s.created_at AS created_at from suspense s left outer join (select p.policyNumber AS POLICY_NUMBER,p.product.schemeCode AS PRODUCT_CODE,p.premiumInfo.paymentFrequency AS PREMIUM_TYPE,p.source.channelcode AS SOURCING_CHANNEL, p.source.subchannelcode AS SOURCING_SUB_CHANNEL,p.source.agentcode AS AGENT_CODE,p.source.branchcode AS SOURCING_BRANCH_CODE,p.product.lob AS productlob,p.source.los AS LOS, p.pos AS POS,p.ruralUrbanSocialIndicator AS URBAN_RURAL_SOCIAL, CONCAT(ph.firstName, ' ',  ph.lastName)  CUSTOMER_NAME  from policy p left outer join party ph on p.policyholder.id = ph.id where p.product.lob = 'RETAIL') p2 on s.policyNumber = p2.POLICY_NUMBER  left outer join (select bill.type AS PAYMENT_TYPE,payment.payment.paymentMode AS PAYMENT_MODE, payment.businessId AS TRANSACTION_ID,CAST(payment.id AS string) AS paymentid,CASE WHEN payment.vendorPayment.vendorCode ='RAZORPAY' THEN '100915971' WHEN payment.vendorPayment.vendorCode ='POLICYBAZAAR' THEN '100917915' ELSE payment.branchcode  END AS RECEIPTING_BRANCH_CODE from  payment) pay on s.paymentId = pay.paymentid left outer join  (select payouttype AS PAYMENT_TYPE1,payoutMode AS PAYMENT_MODE1,businessId AS TRANSACTION_ID1,CAST(id AS string) AS payoutid, CASE WHEN vendorrefund.vendorcode = 'RAZORPAY' or vendorrefund.vendorcode='PAYTM' THEN vendorRefund.vendorRefundId  ELSE instrumentNumber END AS CHECK_NO1 from  refund) refnd on s.payoutid = refnd.payoutid where  p2.productlob = 'RETAIL'"
+            					  
+            suspense_target_df = glueContext.spark_session.sql(sqlQuery).drop_duplicates()
+            
+            sqlQuery_nb = "select s.suspenseType AS suspenseType,s.transactionType AS transactionType, s.reason AS reason, s.policyNumber AS POLICY_NUMBER,s.createdOn AS TRANSACTION_DATE, '' AS URBAN_RURAL_SOCIAL, '' AS PRODUCT_CODE, '' AS PREMIUM_TYPE, s.suspenseAmount AS AMOUNT,TRANSACTION_ID, PAYMENT_MODE,'' AS SOURCING_CHANNEL, '' AS SOURCING_SUB_CHANNEL, '' AS AGENT_CODE, '' AS AGENT_STATUS, '' AS COMMISIONABLE, '' AS SOURCING_BRANCH_CODE, CASE WHEN RECEIPTING_BRANCH_CODE IS NOT NULL THEN RECEIPTING_BRANCH_CODE ELSE '100'  END AS RECEIPTING_BRANCH_CODE, '' AS LOS, '' AS POS, '' AS CUST_GST_NO, s.invoiceNumber AS INVOICE_NO,'' AS REF_INVOICE_NO, PAYMENT_TYPE,CUSTOMER_NAME,'' AS SUPPLIER,'' AS VOUCHER_NO,'' AS CHECK_NO, '' AS SUPPLIER_CODE,s.id AS SUPENSE_ID,CASE WHEN s.paymentId IS NOT NULL THEN s.paymentId ELSE '' END AS PAYIN_ID,'' AS PAY_OUT, s.created_at AS created_at from suspense s left outer join (select bill.type AS PAYMENT_TYPE,payment.payment.paymentMode AS PAYMENT_MODE, payment.businessId AS TRANSACTION_ID,CAST(payment.id AS string) AS paymentid,CASE WHEN payment.vendorPayment.vendorCode ='RAZORPAY' THEN '100915971' WHEN payment.vendorPayment.vendorCode ='POLICYBAZAAR' THEN '100917915' ELSE payment.branchcode  END AS RECEIPTING_BRANCH_CODE,payer.name AS CUSTOMER_NAME from  payment) pay on s.paymentId = pay.paymentid where s.suspenseType ='NB' and s.transactionType ='CREDIT' and s.reason ='NEW_BUSINESS' and s.policyNumber not in (select distinct policyNumber from policy)"
+            
+            suspense_target_df_nb = glueContext.spark_session.sql(sqlQuery_nb).drop_duplicates()
+            
+            if len(suspense_target_df.head(1)) > 0:
+
+                suspense_target_df_nb = suspense_target_df_nb.select(suspense_target_df.columns)                
+            
+                suspense_target_df = suspense_target_df.union(suspense_target_df_nb)
+            
+                suspense_target_df = suspense_target_df.drop_duplicates()
+            
+            else:
+                suspense_target_df = suspense_target_df_nb
+
+            sqlQuery_nb_payout = "select s.suspenseType AS suspenseType,s.transactionType AS transactionType, s.reason AS reason, s.policyNumber AS POLICY_NUMBER,s.createdOn AS TRANSACTION_DATE, '' AS URBAN_RURAL_SOCIAL, '' AS PRODUCT_CODE, '' AS PREMIUM_TYPE, s.suspenseAmount AS AMOUNT,TRANSACTION_ID, CASE WHEN s.payoutid IS NULL THEN PAYMENT_MODE ELSE PAYMENT_MODE1 END AS PAYMENT_MODE,'' AS SOURCING_CHANNEL, '' AS SOURCING_SUB_CHANNEL, '' AS AGENT_CODE, '' AS AGENT_STATUS, '' AS COMMISIONABLE, '' AS SOURCING_BRANCH_CODE, CASE WHEN RECEIPTING_BRANCH_CODE IS NOT NULL THEN RECEIPTING_BRANCH_CODE ELSE '100'  END AS RECEIPTING_BRANCH_CODE, '' AS LOS, '' AS POS, '' AS CUST_GST_NO, s.invoiceNumber AS INVOICE_NO,'' AS REF_INVOICE_NO, CASE WHEN s.payoutid IS NULL THEN PAYMENT_TYPE ELSE PAYMENT_TYPE1 END AS  PAYMENT_TYPE,CUSTOMER_NAME,'' AS SUPPLIER,CASE WHEN s.payoutid IS NULL THEN '' ELSE TRANSACTION_ID1 END AS VOUCHER_NO,CASE WHEN s.payoutid IS NULL THEN '' ELSE CHECK_NO1 END AS CHECK_NO, '' AS SUPPLIER_CODE,s.id AS SUPENSE_ID,CASE WHEN s.paymentId IS NOT NULL THEN s.paymentId ELSE '' END AS PAYIN_ID,'' AS PAY_OUT, s.created_at AS created_at from suspense s left outer join (select bill.type AS PAYMENT_TYPE,payment.payment.paymentMode AS PAYMENT_MODE, payment.businessId AS TRANSACTION_ID,CAST(payment.id AS string) AS paymentid,CASE WHEN payment.vendorPayment.vendorCode ='RAZORPAY' THEN '100915971' WHEN payment.vendorPayment.vendorCode ='POLICYBAZAAR' THEN '100917915' ELSE payment.branchcode  END AS RECEIPTING_BRANCH_CODE,payer.name AS CUSTOMER_NAME from  payment) pay on s.paymentId = pay.paymentid left outer join  (select payouttype AS PAYMENT_TYPE1,payoutMode AS PAYMENT_MODE1,businessId AS TRANSACTION_ID1,CAST(id AS string) AS payoutid, CASE WHEN vendorrefund.vendorcode = 'RAZORPAY' or vendorrefund.vendorcode='PAYTM' THEN vendorRefund.vendorRefundId  ELSE instrumentNumber END AS CHECK_NO1 from  refund) refnd on s.payoutid = refnd.payoutid where s.suspenseType ='PAYOUT' and s.transactionType ='DEBIT' and s.reason ='EXCESS_PREMIUM' and s.policyNumber not in (select distinct policyNumber from policy)"
+
+            suspense_target_df_nb_payout = glueContext.spark_session.sql(sqlQuery_nb_payout).drop_duplicates()
+            
+            suspense_target_df_nb_payout = suspense_target_df_nb_payout.select(suspense_target_df.columns)    
+            
+            if len(suspense_target_df.head(1)) > 0:
+
+                suspense_target_df_nb_payout = suspense_target_df_nb_payout.select(suspense_target_df.columns)                
+            
+                suspense_target_df = suspense_target_df.union(suspense_target_df_nb_payout)
+            
+                suspense_target_df = suspense_target_df.drop_duplicates()
+            
+            else:
+                suspense_target_df = suspense_target_df_nb_payout
+                            
+            suspense_target_df = suspense_target_df.withColumn('EVENT', lit(None).cast(StringType()))
+            suspense_target_df = suspense_target_df.withColumn('TASK', lit(None).cast(StringType()))        
+
+            suspense_target_df.cache()
+            
+            #if anyCancelled:
+            #when no suspense is raised for FREELOOK_CHARGES
+            fromdate = datetime.strftime(datetime.now(timezone('Asia/Kolkata')) - timedelta(days=(int(jobfrequency/24)+1)), '%Y-%m-%d')
+            
+            sqlQuery_policycancellation = "select 'FREELOOK_CHARGES' AS EVENT, 'BOOKING' AS TASK,'' AS suspenseType,'' AS transactionType, s.status AS reason, s.policyNumber AS POLICY_NUMBER,s.createdOn AS TRANSACTION_DATE, URBAN_RURAL_SOCIAL, PRODUCT_CODE, PREMIUM_TYPE, '' AS AMOUNT,'' AS TRANSACTION_ID, '' AS PAYMENT_MODE,SOURCING_CHANNEL, SOURCING_SUB_CHANNEL, AGENT_CODE, '' AS AGENT_STATUS, '' AS COMMISIONABLE, SOURCING_BRANCH_CODE, '100' AS RECEIPTING_BRANCH_CODE, LOS, POS, '' AS CUST_GST_NO, '' AS INVOICE_NO,'' AS REF_INVOICE_NO,'' AS  PAYMENT_TYPE, CUSTOMER_NAME,'' AS SUPPLIER,'' AS VOUCHER_NO,'' AS CHECK_NO, '' AS SUPPLIER_CODE,'' AS SUPENSE_ID,'' AS PAYIN_ID,'' AS PAY_OUT, s.created_at AS created_at from servicerequest s left outer join (select p.policyNumber AS POLICY_NUMBER,p.product.schemeCode AS PRODUCT_CODE,p.premiumInfo.paymentFrequency AS PREMIUM_TYPE,p.source.channelcode AS SOURCING_CHANNEL, p.source.subchannelcode AS SOURCING_SUB_CHANNEL,p.source.agentcode AS AGENT_CODE,p.source.branchcode AS SOURCING_BRANCH_CODE,p.product.lob AS productlob,p.source.los AS LOS, p.pos AS POS,p.ruralUrbanSocialIndicator AS URBAN_RURAL_SOCIAL, CONCAT(ph.firstName, ' ',  ph.lastName)  CUSTOMER_NAME  from policy p left outer join party ph on p.policyholder.id = ph.id where p.product.lob = 'RETAIL') p2 on s.policyNumber = p2.POLICY_NUMBER where  p2.productlob = 'RETAIL' and (s.status='CANCELLED' or s.status='COMPLETED') and (s.type='CANCELLATION' or s.type='FREELOOK') and s.created_at > '" + fromdate + "'"
+            					  
+            policycancellation_target_df = glueContext.spark_session.sql(sqlQuery_policycancellation).drop_duplicates()
+
+            policycancellation_target_df.cache()                        
+            
+            if len(policycancellation_target_df.head(1)) > 0:            
+                if len(suspense_target_df.head(1)) > 0:
+                	policycancellation_target_df = policycancellation_target_df.select(suspense_target_df.columns)                    
+                	suspense_target_df = suspense_target_df.union(policycancellation_target_df)
+                else:
+                	suspense_target_df = policycancellation_target_df
+
+            if len(suspense_target_df.head(1)) > 0:
+                
+                suspense_target_df = suspense_target_df.withColumn('EVENT', when((suspense_target_df["suspenseType"]=='NB') & (suspense_target_df["transactionType"]=='CREDIT') & (suspense_target_df["reason"]=='NEW_BUSINESS') , 'MONEY_IN').when((suspense_target_df["suspenseType"]=='NB') & (suspense_target_df["transactionType"]=='DEBIT') & (suspense_target_df["reason"]=='APPLIED'), 'PREM_APPL').when((suspense_target_df["suspenseType"]=='RENEWAL') & (suspense_target_df["transactionType"]=='CREDIT') & (suspense_target_df["reason"]=='RENEWAL') , 'MONEY_IN').when((suspense_target_df["suspenseType"]=='NB') & (suspense_target_df["transactionType"]=='CREDIT') & (suspense_target_df["reason"]=='COUNTER_OFFER') , 'MONEY_IN').when((suspense_target_df["suspenseType"]=='RENEWAL') & (suspense_target_df["transactionType"]=='DEBIT') & (suspense_target_df["reason"]=='APPLIED'), 'PREM_APPL').when((suspense_target_df["suspenseType"]=='PAYOUT') & (suspense_target_df["transactionType"]=='DEBIT') & (suspense_target_df["reason"]=='REJECT'), 'PREISSUANCE_CANC').when((suspense_target_df["suspenseType"]=='PAYOUT') & (suspense_target_df["transactionType"]=='DEBIT') & (suspense_target_df["reason"]=='FREELOOK'), 'FREELOOK_TRANSFER').when((suspense_target_df["suspenseType"]=='PAYOUT') & (suspense_target_df["transactionType"]=='DEBIT') & (suspense_target_df["reason"]=='EXCESS_PREMIUM'), 'REFUND').when((suspense_target_df["suspenseType"] == 'REINSTATEMENT') & (suspense_target_df["transactionType"] == 'CREDIT') & (suspense_target_df["reason"] == 'POLICY_LAPSED'), 'MONEY_IN').when((suspense_target_df["suspenseType"] == 'REINSTATEMENT') & (suspense_target_df["transactionType"] == 'DEBIT') & (suspense_target_df["reason"] == 'APPLIED'), 'PREM_APPL').otherwise(suspense_target_df["EVENT"]))   
+
+                suspense_target_df = suspense_target_df.withColumn('TASK', when((suspense_target_df["suspenseType"]=='NB') & (suspense_target_df["transactionType"]=='CREDIT') & (suspense_target_df["reason"]=='NEW_BUSINESS') , 'BOOKING').when((suspense_target_df["suspenseType"]=='NB') & (suspense_target_df["transactionType"]=='DEBIT') & (suspense_target_df["reason"]=='APPLIED'), 'BOOKING').when((suspense_target_df["suspenseType"]=='RENEWAL') & (suspense_target_df["transactionType"]=='CREDIT') & (suspense_target_df["reason"]=='RENEWAL') , 'BOOKING').when((suspense_target_df["suspenseType"]=='NB') & (suspense_target_df["transactionType"]=='CREDIT') & (suspense_target_df["reason"]=='COUNTER_OFFER') , 'BOOKING').when((suspense_target_df["suspenseType"]=='RENEWAL') & (suspense_target_df["transactionType"]=='DEBIT') & (suspense_target_df["reason"]=='APPLIED') , 'BOOKING').when((suspense_target_df["suspenseType"]=='PAYOUT') & (suspense_target_df["transactionType"]=='DEBIT') & (suspense_target_df["reason"]=='REJECT'), 'BOOKING').when((suspense_target_df["suspenseType"]=='PAYOUT') & (suspense_target_df["transactionType"]=='DEBIT') & (suspense_target_df["reason"]=='FREELOOK'), 'BOOKING').when((suspense_target_df["suspenseType"]=='PAYOUT') & (suspense_target_df["transactionType"]=='DEBIT') & (suspense_target_df["reason"]=='EXCESS_PREMIUM'), 'BOOKING').when((suspense_target_df["suspenseType"] == 'REINSTATEMENT') & (suspense_target_df["transactionType"] == 'CREDIT') & (suspense_target_df["reason"] == 'POLICY_LAPSED'), 'BOOKING').when((suspense_target_df["suspenseType"] == 'REINSTATEMENT') & (suspense_target_df["transactionType"] == 'DEBIT') & (suspense_target_df["reason"] == 'APPLIED'), 'BOOKING').otherwise(suspense_target_df["TASK"]))
+
+                suspense_target_df = suspense_target_df.withColumn('DUE_DATE', lit(None).cast(StringType()))
+                
+                #suspense_target_df.cache()
+
+                # Reinstament
+                suspense_target_df_dup = suspense_target_df.filter((col("suspenseType") == "REINSTATEMENT") & (col("EVENT") == "PREM_APPL"))
+                sourceentity = "supense_temp"
+                suspense_target_df_dup = DynamicFrame.fromDF(suspense_target_df_dup, glueContext,sourceentity + "_dynamicframe")
+                suspense_target_df_dup.toDF().createOrReplaceTempView(sourceentity)
+                suspense_target_df_dup_drop = suspense_target_df.filter(((col("suspenseType") == "REINSTATEMENT") & (col("EVENT") == "PREM_APPL")) == False)
+                suspense_target_df_dup_query = "select ft.EVENT,ft.TASK, ft.suspenseType,ft.transactionType,ft.reason, ft.POLICY_NUMBER,ft.TRANSACTION_DATE,ft.URBAN_RURAL_SOCIAL, ft.PRODUCT_CODE,ft.PREMIUM_TYPE, detail.totalReinstatementAmount AS AMOUNT,ft.TRANSACTION_ID, ft.PAYMENT_MODE AS PAYMENT_MODE,ft.SOURCING_CHANNEL, ft.SOURCING_SUB_CHANNEL, ft.AGENT_CODE,ft.AGENT_STATUS, ft.COMMISIONABLE, ft.SOURCING_BRANCH_CODE, ft.RECEIPTING_BRANCH_CODE, ft.LOS, ft.POS, ft.CUST_GST_NO, ft.INVOICE_NO, ft.REF_INVOICE_NO, ft.PAYMENT_TYPE, ft.CUSTOMER_NAME, ft.SUPPLIER,ft.VOUCHER_NO,'' AS CHECK_NO,ft.SUPPLIER_CODE,ft.SUPENSE_ID,ft.PAYIN_ID,ft.PAY_OUT, ft.created_at AS created_at,detail.duedate AS DUE_DATE from supense_temp ft left outer join  (select explode(reinstatementResult.details) as detail,policyNumber from reinstatement) ri  on ft.POLICY_NUMBER = ri.policyNumber"
+                suspense_target_df_dup_reinst = glueContext.spark_session.sql(suspense_target_df_dup_query).repartition(1).drop_duplicates()
+                suspense_target_df_dup_reinst = suspense_target_df_dup_reinst.select(suspense_target_df_dup_drop.columns)
+                suspense_target_df = suspense_target_df_dup_drop.union(suspense_target_df_dup_reinst)
+                        
+                #for MONEY_CLEAR
+                suspense_target_df_dup = suspense_target_df.filter((col("EVENT") == "MONEY_IN") & (col("TASK") == "BOOKING"))
+                
+                suspense_target_df_dup = suspense_target_df_dup.withColumn('EVENT',lit("MONEY_CLEAR"))
+                
+                suspense_target_df_dup = suspense_target_df_dup.select(suspense_target_df.columns)
+            
+                suspense_target_df = suspense_target_df.union(suspense_target_df_dup)
+
+                #for PREISSUANCE_CANC_PAY
+                suspense_target_df_canc = suspense_target_df.filter((col("EVENT") == "PREISSUANCE_CANC") & (col("TASK") == "BOOKING"))
+
+                suspense_target_df_canc = suspense_target_df_canc.withColumn('EVENT',lit("PREISSUANCE_CANC_PAY"))
+                
+                suspense_target_df_canc = suspense_target_df_canc.select(suspense_target_df.columns)
+            
+                suspense_target_df = suspense_target_df.union(suspense_target_df_canc)                
+
+
+                #for EXCESS_PREMIUM
+                suspense_target_df_refund = suspense_target_df.filter((col("EVENT") == "REFUND") & (col("TASK") == "BOOKING"))
+
+                suspense_target_df_refund = suspense_target_df_refund.withColumn('EVENT',lit("REFUND_PAY"))
+                
+                suspense_target_df_refund = suspense_target_df_refund.select(suspense_target_df.columns)
+            
+                suspense_target_df = suspense_target_df.union(suspense_target_df_refund)                  
+                
+                #update FREELOOK_CHARGES from policycancellation
+                 
+                freelook_charges_target_df = suspense_target_df.filter((col("EVENT") == "FREELOOK_CHARGES") & (col("TASK") == "BOOKING"))
+                
+                sourceentity = "freelook_charges"
+                
+                freelook_charges_target_dynamicframe= DynamicFrame.fromDF(freelook_charges_target_df, glueContext, sourceentity + "_dynamicframe")
+                
+                freelook_charges_target_dynamicframe.toDF().createOrReplaceTempView(sourceentity)	 
+                
+                freelook_charges_target_df.cache()
+
+                #if anyCancelled:               
+                freelook_charges_query = "select ft.EVENT,ft.TASK, ft.suspenseType,ft.transactionType,ft.reason, ft.POLICY_NUMBER,ft.TRANSACTION_DATE,ft.URBAN_RURAL_SOCIAL, ft.PRODUCT_CODE,ft.PREMIUM_TYPE, pc.totalcharges AS AMOUNT,ft.TRANSACTION_ID, ft.PAYMENT_MODE AS PAYMENT_MODE,ft.SOURCING_CHANNEL, ft.SOURCING_SUB_CHANNEL, ft.AGENT_CODE,ft.AGENT_STATUS, ft.COMMISIONABLE, ft.SOURCING_BRANCH_CODE, ft.RECEIPTING_BRANCH_CODE, ft.LOS, ft.POS, ft.CUST_GST_NO, ft.INVOICE_NO, ft.REF_INVOICE_NO, ft.PAYMENT_TYPE, ft.CUSTOMER_NAME, ft.SUPPLIER,ft.VOUCHER_NO,'' AS CHECK_NO,ft.SUPPLIER_CODE,ft.SUPENSE_ID,ft.PAYIN_ID,ft.PAY_OUT,pc.created_at AS created_at,ft.DUE_DATE from freelook_charges ft inner join (select pc1.totalFreelookCharges AS totalcharges,pc1.policyNumber AS policyNumber ,pc1.created_at AS created_at from policycancellation pc1 inner join  servicerequest sr on sr.requestId = pc1.serviceRequestId where (sr.status='CANCELLED' or sr.status='COMPLETED')) pc on ft.POLICY_NUMBER = pc.policyNumber"
+
+                #freelook_charges_query = "select ft.EVENT,ft.TASK, ft.suspenseType,ft.transactionType,ft.reason, ft.POLICY_NUMBER,ft.TRANSACTION_DATE,ft.URBAN_RURAL_SOCIAL, ft.PRODUCT_CODE,ft.PREMIUM_TYPE, pc.totalcharges AS AMOUNT,ft.TRANSACTION_ID, ft.PAYMENT_MODE AS PAYMENT_MODE,ft.SOURCING_CHANNEL, ft.SOURCING_SUB_CHANNEL, ft.AGENT_CODE,ft.AGENT_STATUS, ft.COMMISIONABLE, ft.SOURCING_BRANCH_CODE, ft.RECEIPTING_BRANCH_CODE, ft.LOS, ft.POS, ft.CUST_GST_NO, ft.INVOICE_NO, ft.REF_INVOICE_NO, ft.PAYMENT_TYPE, ft.CUSTOMER_NAME, ft.SUPPLIER,ft.VOUCHER_NO,'' AS CHECK_NO,ft.SUPPLIER_CODE,ft.SUPENSE_ID,ft.PAYIN_ID,ft.PAY_OUT, pc.created_at AS created_at from freelook_charges ft inner join (select totalFreelookCharges AS totalcharges,policyNumber,created_at from policycancellation) pc on ft.POLICY_NUMBER = pc.policyNumber"
+                
+                suspense_target_df = suspense_target_df.filter((col("EVENT") != "FREELOOK_CHARGES"))                
+                
+                freelook_charges_df1 = glueContext.spark_session.sql(freelook_charges_query).repartition(1).drop_duplicates()
+                
+                freelook_charges_df1.cache()
+                
+                freelook_charges_df1 = freelook_charges_df1.select(suspense_target_df.columns)
+                
+                suspense_target_df = suspense_target_df.union(freelook_charges_df1) 
+                
+                #for FREELOOK_TRANSFER                
+                freelook_transfer_target_df = suspense_target_df.filter((col("EVENT") == "FREELOOK_TRANSFER") & (col("TASK") == "BOOKING"))
+
+                sourceentity = "freelook_transfer"
+                
+                freelook_transfer_target_dynamicframe= DynamicFrame.fromDF(freelook_transfer_target_df, glueContext, sourceentity + "_dynamicframe")
+
+                freelook_transfer_target_dynamicframe.toDF().createOrReplaceTempView(sourceentity)	 
+                
+                freelook_transfer_target_df.cache()
+                
+                #drop FREELOOK_TRANSFER and update it as per servicerequestid
+                suspense_target_df = suspense_target_df.filter((col("EVENT") != "FREELOOK_TRANSFER"))     
+ 
+                #if anyCancelled:                   
+                freelook_transfer_query = "select 'FREELOOK_TRANSFER' AS EVENT,'BOOKING' AS TASK, ft.suspenseType,ft.transactionType,ft.reason, ft.POLICY_NUMBER,ft.TRANSACTION_DATE,ft.URBAN_RURAL_SOCIAL, ft.PRODUCT_CODE, ft.PREMIUM_TYPE, pc.totalRefundAmount AS AMOUNT,ft.TRANSACTION_ID, ft.PAYMENT_MODE AS PAYMENT_MODE,ft.SOURCING_CHANNEL, ft.SOURCING_SUB_CHANNEL, ft.AGENT_CODE,ft.AGENT_STATUS, ft.COMMISIONABLE, ft.SOURCING_BRANCH_CODE, ft.RECEIPTING_BRANCH_CODE, ft.LOS, ft.POS, ft.CUST_GST_NO, ft.INVOICE_NO, ft.REF_INVOICE_NO, ft.PAYMENT_TYPE, ft.CUSTOMER_NAME, ft.SUPPLIER,ft.VOUCHER_NO,ft.CHECK_NO,ft.SUPPLIER_CODE,ft.SUPENSE_ID,ft.PAYIN_ID,ft.PAY_OUT, pc.created_at AS created_at,ft.DUE_DATE  from freelook_transfer ft inner join (select pc1.totalRefundAmount AS totalRefundAmount,pc1.policyNumber AS policyNumber,pc1.created_at AS created_at from policycancellation pc1 inner join  servicerequest sr on sr.requestId = pc1.serviceRequestId where (sr.status='CANCELLED' or sr.status='COMPLETED')) pc on ft.POLICY_NUMBER = pc.policyNumber"
+
+                #freelook_transfer_query = "select 'FREELOOK_TRANSFER' AS EVENT,'BOOKING' AS TASK, ft.suspenseType,ft.transactionType,ft.reason, ft.POLICY_NUMBER,ft.TRANSACTION_DATE,ft.URBAN_RURAL_SOCIAL, ft.PRODUCT_CODE, ft.PREMIUM_TYPE, pc.totalRefundAmount AS AMOUNT,ft.TRANSACTION_ID, ft.PAYMENT_MODE AS PAYMENT_MODE,ft.SOURCING_CHANNEL, ft.SOURCING_SUB_CHANNEL, ft.AGENT_CODE,ft.AGENT_STATUS, ft.COMMISIONABLE, ft.SOURCING_BRANCH_CODE, ft.RECEIPTING_BRANCH_CODE, ft.LOS, ft.POS, ft.CUST_GST_NO, ft.INVOICE_NO, ft.REF_INVOICE_NO, ft.PAYMENT_TYPE, ft.CUSTOMER_NAME, ft.SUPPLIER,ft.VOUCHER_NO,ft.CHECK_NO,ft.SUPPLIER_CODE,ft.SUPENSE_ID,ft.PAYIN_ID,ft.PAY_OUT, pc.created_at AS created_at from freelook_transfer ft inner join (select totalRefundAmount,policyNumber,created_at from policycancellation) pc on ft.POLICY_NUMBER = pc.policyNumber"
+
+                freelook_transfer_df1 = glueContext.spark_session.sql(freelook_transfer_query).repartition(1).drop_duplicates()
+                
+                freelook_transfer_df1.cache()
+                
+                freelook_transfer_df1 = freelook_transfer_df1.select(suspense_target_df.columns)               
+            
+                suspense_target_df = suspense_target_df.union(freelook_transfer_df1) 
+                
+                freelook_transfer_df2 = suspense_target_df.filter((col("EVENT") == "FREELOOK_TRANSFER") & (col("TASK") == "BOOKING"))
+
+                freelook_transfer_df2 = freelook_transfer_df2.withColumn('EVENT',lit("FREELOOK_MONEYOUT"))
+                
+                freelook_transfer_df2 = freelook_transfer_df2.select(suspense_target_df.columns)
+            
+                suspense_target_df = suspense_target_df.union(freelook_transfer_df2)  
+
+                freelook_transfer_df3 = suspense_target_df.filter((col("EVENT") == "FREELOOK_TRANSFER") & (col("TASK") == "BOOKING"))
+
+                freelook_transfer_df3 = freelook_transfer_df3.withColumn('EVENT',lit("FREELOOK_PAYMENT"))
+                
+                freelook_transfer_df3 = freelook_transfer_df3.select(suspense_target_df.columns)                
+            
+                suspense_target_df = suspense_target_df.union(freelook_transfer_df3)       
+
+                suspense_target_df = suspense_target_df.withColumn("CHECK_NO",when(suspense_target_df["EVENT"] == "FREELOOK_TRANSFER", lit("")).otherwise(suspense_target_df["CHECK_NO"]))
+                                   
+                suspense_target_df.cache()
+                
+                #if anyCancelled:                    
+                #Rounding off in case of freelook
+                freelook_refund_rnd_query = "select CASE WHEN totalRefundAmountDiff>0.0 THEN 'RND_POSITIVE' ELSE 'RND_NEGATIVE' END AS EVENT,'BOOKING' AS TASK, ft.suspenseType,ft.transactionType,ft.reason, ft.POLICY_NUMBER,ft.TRANSACTION_DATE,ft.URBAN_RURAL_SOCIAL, ft.PRODUCT_CODE, ft.PREMIUM_TYPE, abs(pc.totalRefundAmountDiff) AS AMOUNT,ft.TRANSACTION_ID, ft.PAYMENT_MODE AS PAYMENT_MODE,ft.SOURCING_CHANNEL, ft.SOURCING_SUB_CHANNEL, ft.AGENT_CODE,ft.AGENT_STATUS, ft.COMMISIONABLE, ft.SOURCING_BRANCH_CODE, ft.RECEIPTING_BRANCH_CODE, ft.LOS, ft.POS, ft.CUST_GST_NO, ft.INVOICE_NO, ft.REF_INVOICE_NO, ft.PAYMENT_TYPE, ft.CUSTOMER_NAME, ft.SUPPLIER,ft.VOUCHER_NO,ft.CHECK_NO,ft.SUPPLIER_CODE,ft.SUPENSE_ID,ft.PAYIN_ID,ft.PAY_OUT, pc.created_at AS created_at,'' AS DUE_DATE from freelook_transfer ft inner join (select (pc1.totalRefundWithoutRoundOff-pc1.totalRefundAmount) AS totalRefundAmountDiff,pc1.policyNumber AS policyNumber,pc1.created_at AS created_at from policycancellation pc1 inner join  servicerequest sr on sr.requestId = pc1.serviceRequestId where (sr.status='CANCELLED' or sr.status='COMPLETED')) pc on ft.POLICY_NUMBER = pc.policyNumber"
+
+                freelook_refund_rnd_df = glueContext.spark_session.sql(freelook_refund_rnd_query).repartition(1).drop_duplicates()
+                
+                freelook_refund_rnd_df.cache()
+
+                freelook_refund_rnd_df = freelook_refund_rnd_df.select(suspense_target_df.columns)                
+            
+                suspense_target_df = suspense_target_df.union(freelook_refund_rnd_df)       
+                                              
+                #suspense_target_df.cache()
+
+                #for FREELOOK_PREM_REVERSAL
+                suspense_target_df_dup = suspense_target_df.filter((col("EVENT") == "FREELOOK_CHARGES") & (col("TASK") == "BOOKING"))
+                
+                suspense_target_df_fl_pr_reversal = suspense_target_df_dup.select(['SUPENSE_ID','PAYIN_ID','PAY_OUT','POLICY_NUMBER','INVOICE_NO','created_at','DUE_DATE','TRANSACTION_DATE'])
+                
+                #print("suspense_target_df_canc_for_reversal=")
+                
+                #suspense_target_df_canc_for_reversal.show(3)
+                
+                sourceentity = "fl_pr_reversal"
+                
+                suspense_target_df_fl_pr_reversal_dynamicframe= DynamicFrame.fromDF(suspense_target_df_fl_pr_reversal, glueContext, sourceentity + "_dynamicframe")
+                           
+                suspense_target_df_fl_pr_reversal_dynamicframe.toDF().createOrReplaceTempView(sourceentity)	                 
+                
+                #uuidUdf= udf(lambda : str(uuid.uuid4()),StringType())    
+                
+                suspense_target_df = suspense_target_df.repartition(1).drop_duplicates()
+
+                suspense_target_df = suspense_target_df.withColumn('randseq',  rand(seed=tseed)*10000000)
+                
+                suspense_target_df = suspense_target_df.withColumn('FINANCE_EXTRACT_ID',concat(lit(datetime.now(timezone('Asia/Kolkata')).strftime('%Y%m%d')),  lpad(suspense_target_df['randseq'].cast(IntegerType()),7,'0')) ) 
+                               
+                suspense_target_df.cache()    
+                
+                suspense_target_df = suspense_target_df.coalesce(1)
+
+                suspense_target_df_temp = suspense_target_df
+                           
+                try:
+                	sourceentity = "hm-financeadapter-activity"
+                
+                	financeadapter_activity_dynamicframe = glueContext.create_dynamic_frame_from_options("s3", {'paths': [sourcepath + sourceentity ], 'recurse':True, 'groupFiles': 'inPartition', "mergeSchema" : "true"}, format="json")
+                	
+                	financeadapter_activity_dynamicframe = resolvechoices(financeadapter_activity_dynamicframe)
+                    
+                	financeadapter_activity_df = financeadapter_activity_dynamicframe.toDF()
+                    
+                	financeadapter_activity_df = financeadapter_activity_df.withColumn('randseq',  lit(''))
+                    
+                	financeadapter_activity_df = financeadapter_activity_df.select(suspense_target_df.columns)
+                    
+                	suspense_target_df_temp = suspense_target_df.union(financeadapter_activity_df)
+                	
+                except:
+                	pass                
+
+                sourceentity = "suspense_target_df"
+                
+                suspense_target_df_dynamicframe= DynamicFrame.fromDF(suspense_target_df_temp, glueContext, sourceentity + "_dynamicframe")
+                
+                suspense_target_df_dynamicframe.toDF().createOrReplaceTempView("financeadapter_activity")
+
+                #fl premium revarsal start
+                                
+                fl_premium_reversalquery = "select 'FREELOOK_PREM_REVERSAL' AS EVENT, 'BOOKING' AS TASK,fa.suspenseType,fa.transactionType,fa.reason,fa.POLICY_NUMBER,cr.TRANSACTION_DATE AS TRANSACTION_DATE, fa.URBAN_RURAL_SOCIAL, fa.PRODUCT_CODE,fa.PREMIUM_TYPE, fa.AMOUNT, fa.TRANSACTION_ID, fa.PAYMENT_MODE,fa.SOURCING_CHANNEL, fa.SOURCING_SUB_CHANNEL, fa.AGENT_CODE, fa.AGENT_STATUS,fa.COMMISIONABLE, fa.SOURCING_BRANCH_CODE, fa.RECEIPTING_BRANCH_CODE,  fa.LOS,fa.POS, fa.CUST_GST_NO, cr.INVOICE_NO AS INVOICE_NO, fa.INVOICE_NO AS REF_INVOICE_NO,fa.PAYMENT_TYPE, fa.CUSTOMER_NAME,fa.SUPPLIER, fa.VOUCHER_NO,fa.CHECK_NO, fa.SUPPLIER_CODE,cr.SUPENSE_ID AS SUPENSE_ID,fa.PAYIN_ID, cr.PAY_OUT AS PAY_OUT, cr.created_at AS created_at,cr.DUE_DATE from financeadapter_activity fa, fl_pr_reversal cr where fa.POLICY_NUMBER = cr.POLICY_NUMBER and fa.EVENT = 'PREM_APPL' and  fa.TASK = 'BOOKING' and (fa.suspenseType='NB' or fa.suspenseType='RENEWAL')"
+                    
+                fl_premium_reversal_df = glueContext.spark_session.sql(fl_premium_reversalquery).repartition(1).drop_duplicates()
+                                
+                fl_premium_reversal_df_count = fl_premium_reversal_df.count()                         
+                
+                if fl_premium_reversal_df_count > 0:
+                   
+                    fl_premium_reversal_df.cache()
+                    
+                    fl_premium_reversal_df = fl_premium_reversal_df.repartition(1).drop_duplicates()
+                   
+                    fl_premium_reversal_df = fl_premium_reversal_df.withColumn('randseq',  rand(seed=tseed)*10000000)
+                
+                    fl_premium_reversal_df = fl_premium_reversal_df.withColumn('FINANCE_EXTRACT_ID',concat(lit(datetime.now(timezone('Asia/Kolkata')).strftime('%Y%m%d')),  lpad(fl_premium_reversal_df['randseq'].cast(IntegerType()),7,'0')) ) 
+                    
+                    fl_premium_reversal_df.cache()
+    
+                    fl_premium_reversal_df = fl_premium_reversal_df.select(suspense_target_df.columns)
+                    
+                    suspense_target_df=suspense_target_df.union(fl_premium_reversal_df)
+                
+                #fl premium revarsal end                
+                
+                suspense_target_df = suspense_target_df.where(col("EVENT").isNotNull())
+
+                suspense_target_df = suspense_target_df.withColumn("CREATED_ON", lit(datetime.now(timezone('Asia/Kolkata'))))
+            
+                suspense_target_df = suspense_target_df.drop(*["randseq"])    
+            
+                #Do changes before dump Keep Transaction ID (Cashbatch ID) only for Money_In and Money_Clear
+                suspense_target_df = suspense_target_df.withColumn("TRANSACTION_ID", when((suspense_target_df["EVENT"] == "MONEY_IN") | (suspense_target_df["EVENT"] == "MONEY_CLEAR"), suspense_target_df["TRANSACTION_ID"]).otherwise(lit("")))
+
+                #Invoice number is generating for Refund related lines?
+                suspense_target_df = suspense_target_df.withColumn("INVOICE_NO", when((suspense_target_df["EVENT"] == "REFUND") | (suspense_target_df["EVENT"] == "REFUND_PAY") | (suspense_target_df["EVENT"] == "FREELOOK_PREM_REVERSAL"), lit("")).otherwise(suspense_target_df["INVOICE_NO"]))
+                
+                #Payment_Mode and CUSTOMER_NAME field to be populated only in Money_In, Money_Clear events (Pay-In events) and in REFUND_PAY , FREELOOK_PAYMENT, PREISSUANCE_CANC_PAY (Pay-out events).
+                suspense_target_df = suspense_target_df.withColumn("PAYMENT_MODE", when((suspense_target_df["EVENT"] == "MONEY_IN") | (suspense_target_df["EVENT"] == "MONEY_CLEAR")| (suspense_target_df["EVENT"] == "PREISSUANCE_CANC_PAY")| (suspense_target_df["EVENT"] == "REFUND_PAY")| (suspense_target_df["EVENT"] == "FREELOOK_PAYMENT") , suspense_target_df["PAYMENT_MODE"]).otherwise(lit("")))
+                suspense_target_df = suspense_target_df.withColumn("CUSTOMER_NAME", when((suspense_target_df["EVENT"] == "MONEY_IN") | (suspense_target_df["EVENT"] == "MONEY_CLEAR")| (suspense_target_df["EVENT"] == "PREISSUANCE_CANC_PAY")| (suspense_target_df["EVENT"] == "REFUND_PAY")| (suspense_target_df["EVENT"] == "FREELOOK_PAYMENT") , suspense_target_df["CUSTOMER_NAME"]).otherwise(lit("")))
+            
+                #VOUCHER_NO field to be populated only in REFUND_PAY , FREELOOK_PAYMENT, PREISSUANCE_CANC_PAY events (Pay-out events) for Refund, Freelook cancellation, Pre-issuance cancellation related scenarios.
+                suspense_target_df = suspense_target_df.withColumn("VOUCHER_NO", when((suspense_target_df["EVENT"] == "PREISSUANCE_CANC_PAY")|(suspense_target_df["EVENT"] == "REFUND_PAY")| (suspense_target_df["EVENT"] == "FREELOOK_PAYMENT") , suspense_target_df["VOUCHER_NO"]).otherwise(lit("")))
+            
+                #CHECK_NO field to be populated only in REFUND_PAY event for Refund related scenarios.
+                suspense_target_df = suspense_target_df.withColumn("CHECK_NO", when((suspense_target_df["EVENT"] == "REFUND_PAY") |  (suspense_target_df["EVENT"] == "FREELOOK_PAYMENT")  |  (suspense_target_df["EVENT"] == "PREISSUANCE_CANC_PAY") , suspense_target_df["CHECK_NO"]).otherwise(lit("")))
+            
+                suspense_target_df = suspense_target_df.repartition(1).drop_duplicates()      
+            
+                suspense_target_df = suspense_target_df.coalesce(1)	
+    
+                #passed_record_count = suspense_target_df.count()
+                
+                #create hash of columns except 'FINANCE_EXTRACT_ID','CREATED_ON','created_at','year','month','day','hour' and dedup
+                suspense_target_df = suspense_target_df.withColumn("row_sha2", sha2(concat_ws("||", *[c for c in suspense_target_df.columns if c not in {'FINANCE_EXTRACT_ID','CREATED_ON','created_at','year','month','day','hour'}]), 256)).dropDuplicates(['row_sha2'])
+
+                #create hash of EVENT	TASK	TRANSACTION_DATE	POLICY_NUMBER	AMOUNT	TRANSACTION_ID
+                suspense_target_df = suspense_target_df.withColumn("row_sha2_ofi", sha2(concat_ws("||", *[c for c in suspense_target_df.columns if c in {'EVENT','TASK','TRANSACTION_DATE','POLICY_NUMBER','AMOUNT','TRANSACTION_ID','PAYMENT_TYPE'}]), 256))
+
+                # create hash of EVENT	TASK	TRANSACTION_DATE	POLICY_NUMBER	AMOUNT	TRANSACTION_ID ,PAYMENT_TYPE,DUE_DATE,suspenseType
+                suspense_target_df = suspense_target_df.withColumn("row_sha2_ofi2", sha2(concat_ws("||", *[c for c in suspense_target_df.columns if c in {'EVENT','TASK','TRANSACTION_DATE','POLICY_NUMBER','AMOUNT','TRANSACTION_ID','PAYMENT_TYPE','DUE_DATE', 'suspenseType'}]),256)).dropDuplicates(['row_sha2_ofi2'])
+               
+                sourceentity = "hm-financeadapter-activity"
+                
+                #check for any duplicate extract id already generated before
+                try:
+                    financeadapter_activity_dynamicframe = glueContext.create_dynamic_frame_from_options("s3", {'paths': [sourcepath + sourceentity ], 'recurse':True, 'groupFiles': 'inPartition', "mergeSchema" : "true"}, format="json")              
+                    			
+                    financeadapter_activity_dynamicframe = resolvechoices(financeadapter_activity_dynamicframe)
+                    
+                    financeadapter_activity_dynamicframe.toDF().createOrReplaceTempView("financeadapter_activity")
+                    
+                    financeadapter_activity_dynamicframe_latest = glueContext.spark_session.sql("select * from financeadapter_activity where CREATED_ON > '"  +  str(datetime.now(timezone('Asia/Kolkata')).strftime('%Y-%m-%d')) + "'").drop_duplicates()
+    
+                    extractids = financeadapter_activity_dynamicframe_latest.select("FINANCE_EXTRACT_ID").repartition(1).drop_duplicates().collect()
+                        
+                    suspense_target_df = remove_duplicate_extractid_from_df(suspense_target_df,extractids,tseed)
+                except:
+                	pass  
+
+                extractids = suspense_target_df.select("FINANCE_EXTRACT_ID").groupBy(col("FINANCE_EXTRACT_ID")).count().distinct().filter(col("count")>1).select("FINANCE_EXTRACT_ID").repartition(1).drop_duplicates().collect()
+
+                suspense_target_df = remove_duplicate_extractid_from_df(suspense_target_df,extractids,tseed)
+                
+                #replaced duplicate extract ids if found
+                
+                suspense_target_dynamicframe= DynamicFrame.fromDF(suspense_target_df, glueContext, "activity_dynamicframe")
+                            
+                filepath = sourceentity + "/" + "year=" + str(datetime.now(timezone('Asia/Kolkata')).year).zfill(2) + "/"  + "month=" + str(datetime.now(timezone('Asia/Kolkata')).month).zfill(2)  + "/"  + "day=" + str(datetime.now(timezone('Asia/Kolkata')).day).zfill(2)  + "/"  + "hour=" + str(datetime.now(timezone('Asia/Kolkata')).hour).zfill(2)
+                                   
+                glueContext.write_dynamic_frame.from_options(frame = suspense_target_dynamicframe, connection_type = "s3", connection_options = {"path": sourcepath + "/" + filepath}, format = "json")
+                                   
+ 
+                suspense_target_df = suspense_target_dynamicframe.toDF()
+            
+                #filter data and queries for breakdown
+
+                #PREM_APPL and FREELOOK_PREM_REVERSAL breakdown                
+                financeadapter_activity_df = suspense_target_df.filter(((col("EVENT") == "PREM_APPL") |  (col("EVENT") == "FREELOOK_PREM_REVERSAL")) & (col("TASK") == "BOOKING"))
+                
+                financeadapter_activity_dynamicframe = DynamicFrame.fromDF(financeadapter_activity_df, glueContext, sourceentity + "_dynamicframe")
+                                
+                financeadapter_activity_dynamicframe.toDF().createOrReplaceTempView("financeadapter_activity")
+                
+                selectedpoliciesQuery = "select policyNumber,premiumInfo,coverages,startDate from policy"
+                
+                selectedpolicies_df = glueContext.spark_session.sql(selectedpoliciesQuery).repartition(1).drop_duplicates()
+                
+                
+                selectedpolicies_df.cache()
+                
+                
+                selectedpolicies_df_dynamicframe= DynamicFrame.fromDF(selectedpolicies_df, glueContext, "selectedpolicies_dynamicframe")
+                
+                
+                selectedpolicies_df_dynamicframe.toDF().createOrReplaceTempView("selectedpolicies")
+                                
+                #prem_appl_breakdownsqlQuery = "select fa.FINANCE_EXTRACT_ID AS FINANCE_EXTRACT_ID,coverage.coverageClass PREMIUM_INDICATOR,coverage.premium AS AMOUNT,policyNumber,premiumInfo,coverage.cGstAmount AS cGstAmount,coverage.sGstAmount AS sGstAmount,coverage.iGstAmount AS iGstAmount,coverage.uGstAmount AS uGstAmount,'' AS stampDutyAmount,coverage.loading AS loadings,premiumInfo.gstRates.cgstTaxRate AS CGST_RATE, premiumInfo.gstRates.sgstTaxRate AS SGST_RATE,premiumInfo.gstRates.igstTaxRate AS IGST_RATE,premiumInfo.gstRates.ugstTaxRate AS UGST_RATE,1 AS YOP,created_at from  financeadapter_activity fa inner join (select explode(coverages) as coverage,policyNumber,premiumInfo from selectedpolicies) p4 on fa.POLICY_NUMBER = p4.policyNumber where coverage.coverageClass!='NULL' and (fa.EVENT = 'PREM_APPL' or fa.EVENT = 'FREELOOK_PREM_REVERSAL') and fa.TASK = 'BOOKING'"
+     
+                prem_appl_breakdownsqlQuery = "select fa.FINANCE_EXTRACT_ID AS FINANCE_EXTRACT_ID,coverage.coverageClass PREMIUM_INDICATOR,coverage.premium AS AMOUNT,policyNumber,premiumInfo,coverage.cGstAmount AS cGstAmount,coverage.sGstAmount AS sGstAmount,coverage.iGstAmount AS iGstAmount,coverage.uGstAmount AS uGstAmount,'' AS stampDutyAmount,coverage.loading AS loadings,(coverage.cgstTaxRate + coverage.sgstTaxRate + coverage.igstTaxRate + coverage.ugstTaxRate) AS PREM_GST_RATE,coverage.cgstTaxRate AS CGST_RATE, coverage.sgstTaxRate AS SGST_RATE,coverage.igstTaxRate AS IGST_RATE,coverage.ugstTaxRate AS UGST_RATE,case when PAYMENT_TYPE = 'NB' then 1 ELSE CEILING(months_between(current_date(), startDate)/12) END AS YOP,created_at from  financeadapter_activity fa inner join (select explode(coverages) as coverage,policyNumber,premiumInfo, startDate from selectedpolicies) p4 on fa.POLICY_NUMBER = p4.policyNumber where p4.coverage.coverageClass!='NULL' and (fa.EVENT = 'PREM_APPL' or fa.EVENT = 'FREELOOK_PREM_REVERSAL') and fa.TASK = 'BOOKING' and fa.suspenseType != 'REINSTATEMENT'"
+               
+                prem_appl_breakdown_suspense_target_df = glueContext.spark_session.sql(prem_appl_breakdownsqlQuery).repartition(1).drop_duplicates()
+    
+                testloading1 = prem_appl_breakdown_suspense_target_df.filter((col("loadings").isNotNull()) & (size(col("loadings"))>0))    
+                
+                if testloading1.count()>0:
+                    testloading12 = testloading1.select(['FINANCE_EXTRACT_ID', 'policyNumber', 'PREM_GST_RATE', 'CGST_RATE', 'SGST_RATE', 'IGST_RATE','UGST_RATE', 'premiumInfo', 'PREMIUM_INDICATOR', 'loadings', 'YOP'])
+                    testloading12.cache()
+                    selectedpolicies_df_dynamicframe= DynamicFrame.fromDF(testloading12, glueContext, "testloading12_dynamicframe")
+                    selectedpolicies_df_dynamicframe.toDF().createOrReplaceTempView("policyloadings")
+                    testloading2_breakdownsqlQuery = "select fa.FINANCE_EXTRACT_ID AS FINANCE_EXTRACT_ID,concat(PREMIUM_INDICATOR_MAIN, '_' , loading.type) AS PREMIUM_INDICATOR,loading.amount AS AMOUNT,loading.cgst AS cGstAmount,loading.sgst AS sGstAmount,loading.igst AS iGstAmount,loading.ugst AS uGstAmount,'' AS stampDutyAmount, PREM_GST_RATE,CGST_RATE, SGST_RATE,IGST_RATE, UGST_RATE, YOP,created_at from  financeadapter_activity fa inner join (select explode(loadings) as loading,premiumInfo,policyNumber,PREM_GST_RATE,CGST_RATE,SGST_RATE,IGST_RATE,UGST_RATE,PREMIUM_INDICATOR AS PREMIUM_INDICATOR_MAIN,FINANCE_EXTRACT_ID, YOP from policyloadings) p4 on fa.POLICY_NUMBER = p4.policyNumber and fa.FINANCE_EXTRACT_ID=p4.FINANCE_EXTRACT_ID where (fa.EVENT = 'PREM_APPL' or fa.EVENT = 'FREELOOK_PREM_REVERSAL') and fa.TASK = 'BOOKING' and fa.suspenseType != 'REINSTATEMENT'"
+                    testloading2_target_df = glueContext.spark_session.sql(testloading2_breakdownsqlQuery).repartition(1).drop_duplicates()
+                    prem_appl_breakdown_suspense_target_df = prem_appl_breakdown_suspense_target_df.drop(*["policyNumber","premiumInfo","loadings"])
+                    
+                    testloading2_target_df = testloading2_target_df.select(prem_appl_breakdown_suspense_target_df.columns)
+                        
+                    prem_appl_breakdown_suspense_target_df=prem_appl_breakdown_suspense_target_df.union(testloading2_target_df)
+    
+                prem_appl_breakdown_suspense_target_df = prem_appl_breakdown_suspense_target_df.drop(*["policyNumber","premiumInfo","loadings"])
+
+                breakdown_suspense_target_df = prem_appl_breakdown_suspense_target_df
+
+                #if anyCancelled:                            
+                #freelook charges breakdown
+                suspense_target_df = suspense_target_dynamicframe.toDF()
+                financeadapter_activity_df = suspense_target_df.filter((col("EVENT") == "FREELOOK_CHARGES") & (col("TASK") == "BOOKING"))
+                
+                financeadapter_activity_dynamicframe = DynamicFrame.fromDF(financeadapter_activity_df, glueContext, sourceentity + "_dynamicframe")
+                                
+                financeadapter_activity_dynamicframe.toDF().createOrReplaceTempView("financeadapter_activity")
+                
+                selectedcancelledpoliciesQuery = "select p1.policyNumber AS policyNumber,p1.medicalFee AS medicalFee, p1.coverages AS coverages, p2.premiumInfo AS premiumInfo, p2.startDate from policycancellation p1 inner join  servicerequest sr on sr.requestId = p1.serviceRequestId inner join policy p2 on p1.policyNumber = p2.policyNumber where (sr.status='CANCELLED' or sr.status='COMPLETED')"
+    
+                #selectedcancelledpoliciesQuery = "select policyNumber,medicalFee, coverages from policycancellation"
+                
+                selectedcancelledpolicies_df = glueContext.spark_session.sql(selectedcancelledpoliciesQuery).repartition(1).drop_duplicates()
+                            
+                selectedcancelledpolicies_df.cache()
+                            
+                selectedcancelledpolicies_df_dynamicframe= DynamicFrame.fromDF(selectedcancelledpolicies_df, glueContext, "selectedcancelledpolicies_dynamicframe")
+                            
+                selectedcancelledpolicies_df_dynamicframe.toDF().createOrReplaceTempView("selectedcancelledpolicies")
+    
+                freelook_breakdownsqlQuery1 = "select fa.FINANCE_EXTRACT_ID AS FINANCE_EXTRACT_ID,r.coverageClass AS PREMIUM_INDICATOR,coverage.proratedMortality AS AMOUNT,policyNumber,premiumInfo,coverage.proratedCgst AS cGstAmount,coverage.proratedSgst AS sGstAmount,coverage.proratedIgst AS iGstAmount,coverage.proratedUgst AS uGstAmount,coverage.stampDutyAmount AS stampDutyAmount,coverage.proratedExtraPrems AS loadings,PREM_GST_RATE,CGST_RATE, SGST_RATE,IGST_RATE,UGST_RATE, case when PAYMENT_TYPE = 'NB' then 1 ELSE CEILING(months_between(current_date(), startDate)/12) END AS YOP,created_at from  financeadapter_activity fa inner join (select PREM_GST_RATE,CGST_RATE, SGST_RATE,IGST_RATE,UGST_RATE,p4.policyNumber,p4.premiumInfo,c4.coverageClass,coverage,p4.startDate from (select explode(coverages) as coverage,policyNumber,premiumInfo,startDate from selectedcancelledpolicies) p4 inner join (select policyNumber, coveragesorg.code as code,coveragesorg.coverageClass, premiumInfo,(coveragesorg.cgstTaxRate + coveragesorg.sgstTaxRate + coveragesorg.igstTaxRate + coveragesorg.ugstTaxRate) AS PREM_GST_RATE, coveragesorg.igstTaxRate as IGST_RATE, coveragesorg.cgstTaxRate as CGST_RATE, coveragesorg.sgstTaxRate as SGST_RATE, coveragesorg.ugstTaxRate as UGST_RATE from (select policyNumber, premiumInfo, explode(coverages) as coveragesorg from selectedpolicies) p1) c4 on c4.code=coverage.productCode where coverage.productCode!='NULL' and c4.policyNumber=p4.policyNumber) r on fa.POLICY_NUMBER = r.policyNumber where fa.EVENT = 'FREELOOK_CHARGES' and fa.TASK = 'BOOKING'"
+                
+                freelook_breakdown_suspense_target_df = glueContext.spark_session.sql(freelook_breakdownsqlQuery1).repartition(1).drop_duplicates()
+
+                testloading1_freelook = freelook_breakdown_suspense_target_df.filter((col("loadings").isNotNull()) & (size(col("loadings"))>0))
+    
+                if testloading1_freelook.count()>0:
+                    testloading12_freelook = testloading1_freelook.select(['FINANCE_EXTRACT_ID', 'policyNumber', 'PREM_GST_RATE', 'CGST_RATE', 'SGST_RATE', 'IGST_RATE','UGST_RATE', 'premiumInfo', 'PREMIUM_INDICATOR', 'loadings', 'YOP'])
+                    testloading12_freelook.cache()
+                    selectedcancelledpolicies_df_dynamicframe= DynamicFrame.fromDF(testloading12_freelook, glueContext, "testloading12_freelook_dynamicframe")
+                    selectedcancelledpolicies_df_dynamicframe.toDF().createOrReplaceTempView("freelookpolicyloadings")
+                    
+                    glueContext.spark_session.sql("set spark.sql.caseSensitive=true")
+                    
+                    testloading2_freelook_breakdownsqlQuery = "select fa.FINANCE_EXTRACT_ID AS FINANCE_EXTRACT_ID,concat(PREMIUM_INDICATOR_MAIN, '_' , loading.extraType) AS PREMIUM_INDICATOR,loading.extraPrem AS AMOUNT,loading.cgstAmount AS cGstAmount,loading.sgstAmount AS sGstAmount,loading.igstAmount AS iGstAmount,loading.ugstAmount AS uGstAmount,'' AS stampDutyAmount,PREM_GST_RATE,CGST_RATE,SGST_RATE,IGST_RATE,UGST_RATE, YOP, created_at from financeadapter_activity fa inner join (select explode(loadings) as loading,premiumInfo,policyNumber,PREMIUM_INDICATOR AS PREMIUM_INDICATOR_MAIN,FINANCE_EXTRACT_ID,PREM_GST_RATE,CGST_RATE,SGST_RATE,IGST_RATE,UGST_RATE, YOP from freelookpolicyloadings) p4 on fa.POLICY_NUMBER = p4.policyNumber and fa.FINANCE_EXTRACT_ID=p4.FINANCE_EXTRACT_ID where fa.EVENT = 'FREELOOK_CHARGES' and fa.TASK = 'BOOKING'"
+                    testloading2_freelook_target_df = glueContext.spark_session.sql(testloading2_freelook_breakdownsqlQuery).repartition(1).drop_duplicates()
+                    
+                    glueContext.spark_session.sql("set spark.sql.caseSensitive=false")
+                       
+                    freelook_breakdown_suspense_target_df = freelook_breakdown_suspense_target_df.drop(*["policyNumber","premiumInfo","loadings"])
+                    
+                    testloading2_freelook_target_df = testloading2_freelook_target_df.select(freelook_breakdown_suspense_target_df.columns)
+                        
+                    freelook_breakdown_suspense_target_df=freelook_breakdown_suspense_target_df.union(testloading2_freelook_target_df)
+    
+                freelook_breakdown_suspense_target_df = freelook_breakdown_suspense_target_df.drop(*["policyNumber","premiumInfo","loadings"])
+                
+                freelook_breakdownsqlQuery2 = "select fa.FINANCE_EXTRACT_ID AS FINANCE_EXTRACT_ID,'MEDICAL' AS PREMIUM_INDICATOR,p4.medicalFee AS AMOUNT,'' AS cGstAmount,'' AS sGstAmount,'' AS iGstAmount,'' AS uGstAmount,'' AS stampDutyAmount,'' AS PREM_GST_RATE,'' AS CGST_RATE, '' AS SGST_RATE,'' AS IGST_RATE,'' AS UGST_RATE, case when PAYMENT_TYPE = 'NB' then 1 ELSE CEILING(months_between(current_date(), startDate)/12) END AS YOP,created_at from  financeadapter_activity fa inner join (select medicalFee,policyNumber,startDate from selectedcancelledpolicies) p4 on fa.POLICY_NUMBER = p4.policyNumber where fa.EVENT = 'FREELOOK_CHARGES' and fa.TASK = 'BOOKING'"
+                
+                freelook_breakdown_suspense_target_df2 = glueContext.spark_session.sql(freelook_breakdownsqlQuery2).repartition(1).drop_duplicates()
+                
+                freelook_breakdown_suspense_target_df2 = freelook_breakdown_suspense_target_df2.select(freelook_breakdown_suspense_target_df.columns)
+    
+                freelook_breakdown_suspense_target_df = freelook_breakdown_suspense_target_df.union(freelook_breakdown_suspense_target_df2)
+                
+                freelook_breakdown_suspense_target_df.cache()
+                                
+                freelook_breakdown_suspense_target_df = freelook_breakdown_suspense_target_df.select(prem_appl_breakdown_suspense_target_df.columns)
+                
+                breakdown_suspense_target_df = prem_appl_breakdown_suspense_target_df.union(freelook_breakdown_suspense_target_df)
+    
+
+                # reinstatement breakdown
+                financeadapter_activity_df = suspense_target_df.filter((col("EVENT") == "PREM_APPL") & (col("suspenseType") == "REINSTATEMENT"))
+                financeadapter_activity_dynamicframe = DynamicFrame.fromDF(financeadapter_activity_df, glueContext,sourceentity + "_dynamicframe")
+                financeadapter_activity_dynamicframe.toDF().createOrReplaceTempView("financeadapter_activity")
+
+                rein_selectedpoliciesQuery = "select policyNumber, details.duedate as duedate, explode(details.coverageDetails) as coverageDetails from (select policyNumber, explode(reinstatementResult.details) as details from reinstatement)"
+                rein_selectedpolicies_df = glueContext.spark_session.sql(rein_selectedpoliciesQuery).repartition(1).drop_duplicates()
+
+                glueContext.spark_session.sql("set spark.sql.caseSensitive=true")
+                rein_selectedpolicies_df.cache()
+                rein_selectedpolicies_df_dynamicframe = DynamicFrame.fromDF(rein_selectedpolicies_df, glueContext,"rein_selectedpolicies_dynamicframe")
+                rein_selectedpolicies_df_dynamicframe.toDF().createOrReplaceTempView("rein_selectedpolicies")
+
+                reinstatement_breakdownsqlQuery = "select distinct fa.FINANCE_EXTRACT_ID as FINANCE_EXTRACT_ID, r.coverageClass as PREMIUM_INDICATOR, r.overDueGrossPremium as AMOUNT, r.policyNumber as policyNumber, r.cgstAmountOfGrossPrem as cGstAmount, r.sgstAmountOfGrossPrem as sGstAmount, r.igstAmountOfGrossPrem as iGstAmount, r.ugstAmountOfGrossPrem as uGstAmount,'' as stampDutyAmount, PREM_GST_RATE, CGST_RATE, SGST_RATE, IGST_RATE, UGST_RATE, YOP,created_at, overDueExtraPremiums from financeadapter_activity fa inner join (select ri.policyNumber, ri.duedate, pol1.coverageClass, IGST_RATE, SGST_RATE, CGST_RATE, UGST_RATE,igstAmountOfGrossPrem, cgstAmountOfGrossPrem, sgstAmountOfGrossPrem, ugstAmountOfGrossPrem, overDueGrossPremium,PREM_GST_RATE,overDueExtraPremiums, YOP, productCode from (select distinct r1.policyNumber, r2.duedate, coverageDetails.productCode as productCode, coverageDetails.cgstAmountOfGrossPrem as cgstAmountOfGrossPrem, coverageDetails.igstAmountOfGrossPrem as igstAmountOfGrossPrem, coverageDetails.sgstAmountOfGrossPrem as sgstAmountOfGrossPrem, coverageDetails.ugstAmountOfGrossPrem as ugstAmountOfGrossPrem ,coverageDetails.overDueGrossPremium, coverageDetails.overDueExtraPremiums, r2.YOP, coverageDetails from rein_selectedpolicies r1 inner join (select policyNumber, duedate, Nvl(coverageDetails.yearOfPremium, 1) AS YOP from rein_selectedpolicies) r2 on r1.policyNumber = r2.policyNumber and r1.duedate = r2.duedate ) ri inner join (select policyNumber, coverage.code as code, coverage.coverageClass, premiumInfo,(coverage.cgstTaxRate + coverage.sgstTaxRate + coverage.igstTaxRate + coverage.ugstTaxRate) AS PREM_GST_RATE, coverage.igstTaxRate as IGST_RATE, coverage.cgstTaxRate as CGST_RATE, coverage.sgstTaxRate as SGST_RATE, coverage.ugstTaxRate as UGST_RATE from (select policyNumber, premiumInfo, explode(coverages) as coverage from selectedpolicies) p1) pol1 on pol1.code = ri.productCode and pol1.policyNumber=ri.policyNumber) r on fa.POLICY_NUMBER = r.policyNumber where (fa.EVENT = 'PREM_APPL' or fa.EVENT = 'FREELOOK_PREM_REVERSAL') and fa.TASK = 'BOOKING' and fa.suspenseType = 'REINSTATEMENT' and fa.DUE_DATE = r.duedate"
+
+                reinstatement_breakdown_suspense_target_df = glueContext.spark_session.sql(reinstatement_breakdownsqlQuery).repartition(1).drop_duplicates()
+                reinstatement_breakdown_suspense_target_df.show()
+
+                testloading1 = reinstatement_breakdown_suspense_target_df.filter((col("overDueExtraPremiums").isNotNull()) & (size(col("overDueExtraPremiums")) > 0))
+
+                if testloading1.count() > 0:
+                    testloading12 = testloading1.select(['policyNumber', 'CGST_RATE', 'SGST_RATE', 'IGST_RATE', 'UGST_RATE', 'overDueExtraPremiums','PREMIUM_INDICATOR', 'FINANCE_EXTRACT_ID', 'PREM_GST_RATE', 'YOP'])
+                    testloading12.cache()
+                    selectedpolicies_df_dynamicframe = DynamicFrame.fromDF(testloading12, glueContext,"testloading12_dynamicframe")
+                    selectedpolicies_df_dynamicframe.toDF().createOrReplaceTempView("reinstatementloadings")
+                    testloading2_breakdownsqlQuery = "select fa.FINANCE_EXTRACT_ID AS FINANCE_EXTRACT_ID,concat(PREMIUM_INDICATOR_MAIN, '_' , loading.extraType) AS PREMIUM_INDICATOR, loading.extraPrem AS AMOUNT, loading.cgstAmount AS cGstAmount,loading.sgstAmount AS sGstAmount,loading.igstAmount AS iGstAmount,loading.ugstAmount AS uGstAmount,'' AS stampDutyAmount,PREM_GST_RATE,CGST_RATE,SGST_RATE,IGST_RATE,UGST_RATE, YOP,created_at from  financeadapter_activity fa inner join (select explode(overDueExtraPremiums) as loading,policyNumber,PREMIUM_INDICATOR AS PREMIUM_INDICATOR_MAIN,FINANCE_EXTRACT_ID,PREM_GST_RATE,CGST_RATE,SGST_RATE,IGST_RATE,UGST_RATE,YOP from reinstatementloadings) p4 on fa.POLICY_NUMBER = p4.policyNumber and fa.FINANCE_EXTRACT_ID=p4.FINANCE_EXTRACT_ID where (fa.EVENT = 'PREM_APPL' or fa.EVENT = 'FREELOOK_PREM_REVERSAL') and fa.TASK = 'BOOKING' and fa.suspenseType = 'REINSTATEMENT'"
+
+                    testloading2_target_df = glueContext.spark_session.sql(testloading2_breakdownsqlQuery).repartition(1).drop_duplicates()
+
+                    reinstatement_breakdown_suspense_target_df = reinstatement_breakdown_suspense_target_df.drop(*["policyNumber", "overDueExtraPremiums"])
+
+                    testloading2_target_df = testloading2_target_df.select(reinstatement_breakdown_suspense_target_df.columns)
+
+                    reinstatement_breakdown_suspense_target_df = reinstatement_breakdown_suspense_target_df.union(testloading2_target_df)
+
+                reinstatement_breakdown_suspense_target_df = reinstatement_breakdown_suspense_target_df.drop(*["policyNumber", "overDueExtraPremiums"])
+
+                reinstatement_breakdown_suspense_target_df = reinstatement_breakdown_suspense_target_df.select(breakdown_suspense_target_df.columns)
+
+                breakdown_suspense_target_df = breakdown_suspense_target_df.union(reinstatement_breakdown_suspense_target_df)    
+                sourceentity2 = "hm-financeadapter-breakdown"
+                           
+                breakdown_suspense_target_dynamicframe= DynamicFrame.fromDF(breakdown_suspense_target_df, glueContext, "breakdown_dynamicframe")
+                
+                filepath = sourceentity2 + "/" + "year=" + str(datetime.now(timezone('Asia/Kolkata')).year).zfill(2) + "/"  + "month=" + str(datetime.now(timezone('Asia/Kolkata')).month).zfill(2)  + "/"  + "day=" + str(datetime.now(timezone('Asia/Kolkata')).day).zfill(2)  + "/"  + "hour=" + str(datetime.now(timezone('Asia/Kolkata')).hour).zfill(2)
+                					   
+                glueContext.write_dynamic_frame.from_options(frame = breakdown_suspense_target_dynamicframe, connection_type = "s3", connection_options = {"path": sourcepath + "/" + filepath}, format = "json")
+                   
+    except Exception as e:
+        exc_type, exc_obj, exc_tb = sys.exc_info()
+        print("errordesc1=",exc_type, "line no" , exc_tb.tb_lineno)        
+        errordesc = str(e)
+        print("entityadapters=" + str(errordesc))
+
+
+def removeSchemaRow(datasourceDynamicOrig, id):
+    if id == 'hm-policy':
+        return datasourceDynamicOrig.filter(col("policyNumber") != id)
+    elif id == 'hm-party':
+        return datasourceDynamicOrig.filter(col("id") != id)
+    return datasourceDynamicOrig
+
+
+def iterateSchemaAndFix(actual_schema_json,drow):
+    for field in actual_schema_json["fields"]:
+        if type(field["type"]) == str:
+            print(field["name"] + " " + str(field["type"]))            
+        if type(field["type"]) == dict:
+            print(field["name"] + " " + str(type(field["type"]).__name__))
+            if field["name"] in drow and (type(drow[field["name"]]) == str or drow[field["name"]] == None):
+                drow[field["name"]] = {}
+            if "fields" in field["type"]:
+                iterateSchemaAndFix(field["type"],drow)
+            if "elementType" in field["type"]:
+                print(field["name"] + " " + str(field["type"]["type"]))
+                if field["name"] in drow:
+                    if type(field["type"]["elementType"]) == str:
+                        print(field["name"])
+                        drow[field["name"]] = ""
+                    elif str(field["type"]["type"]) == 'array':
+                        #print(drow[field["name"]])
+                        drow[field["name"]] = []                 
+                        iterateSchemaAndFix(field["type"]["elementType"],drow)
+
+def iterateDrow(actual_schema_json,drow):
+  for k, v in drow.items():
+    if isinstance(v, dict):
+      iterateDrow(actual_schema_json,v)
+    else:
+        if type(drow[k]) == str or drow[k] is None:
+            iterateSchemaAndFix(actual_schema_json,drow)
+
+
+def map_schema(actual_schema_json, row):
+    drow = row.asDict()
+    iterateDrow(actual_schema_json,drow)
+    return drow
+
+
+def fixdataframeschema(partitioned_dataframe,actual_df_schema):
+    actual_schema_json = json.loads(actual_df_schema.json())
+    mappedrdd = partitioned_dataframe.rdd.map(lambda x: map_schema(actual_schema_json, x))
+    partitioned_dataframe = glueContext.createDataFrame(mappedrdd, actual_df_schema)
+
+    return(partitioned_dataframe)
+    
+def processEntity(sourceentity,targetentity):
+    print("started processing source Entity : {} and target Entity: {}", sourceentity, targetentity)
+    errordesc = ''
+    maxbatchidint = 0
+    datasourceDynamicOrig = None
+    reject_record_count = 0
+    
+    try:
+
+        delete_latest_staging_data_for_batch(targetbucket,targetstaging + "/" + targetentity)
+        
+        maxbatchidint = getstagingbatchid(JOB_NAME,sourceentity)
+            
+        if not maxbatchidint:
+            maxbatchidint = 1
+        else:
+            maxbatchidint = str(1+int(maxbatchidint))
+            
+        jobfrequency = math.ceil(float(lastsuccesstimediff(JOB_NAME,sourceentity)))
+        
+        print("Running for maxbatchidint=" + str(maxbatchidint) ) #+ " and lastsuccesstime=" + str(lastsuccesstime))
+        
+        jobBatchMetadataRecords(JOB_NAME,sourceentity,maxbatchidint,"STARTED",errordesc,None,None)
+        
+        copy_latest_raw_data_for_batch(s3BucketName,sourceentity,sourcestaging,jobfrequency)
+            
+        datasourceDynamicOrig = glueContext.create_dynamic_frame_from_options("s3", {'paths': [sourcepath + sourcestaging + "/" + sourceentity, targetpath + schemastaging + "/" + sourceentity], 'recurse':True, 'groupFiles': 'inPartition',"mergeSchema" : "true"}, format="json")
+
+        if datasourceDynamicOrig.toDF().count() > 0:
+            datasourceDynamicOrig = resolvechoices(datasourceDynamicOrig)
+
+        datasourceDynamicOrig = datasourceDynamicOrig.toDF()
+
+        datasourceDynamicOrig = removeSchemaRow(datasourceDynamicOrig, sourceentity)
+
+        datasourceDynamicOrig = DynamicFrame.fromDF(datasourceDynamicOrig, glueContext, targetentity + "_dataframe")
+
+        passed_record_count = 0
+        
+        if datasourceDynamicOrig.toDF().count() > 0:
+                
+            # datasourceDynamicOrig = resolvechoices(datasourceDynamicOrig)
+            
+            entityadapters(glueContext,datasourceDynamicOrig,targetentity,jobfrequency)
+            
+            # partitioned_dataframe = datasourceDynamicOrig.toDF() 
+            
+            dfschema = datasourceDynamicOrig.toDF().schema
+            
+            dfschemajson = all_types_tostring(dfschema.json())
+            
+            new_schema = StructType.fromJson(json.loads(dfschemajson))
+            
+            partitioned_dataframe = glueContext.spark_session.createDataFrame(datasourceDynamicOrig.toDF().rdd, schema=new_schema)        																												 
+    		       
+    																
+            filepath = targetentity + "/" + "year=" + str(datetime.now(timezone('Asia/Kolkata')).year).zfill(2) + "/"  + "month=" + str(datetime.now(timezone('Asia/Kolkata')).month).zfill(2)  + "/"  + "day=" + str(datetime.now(timezone('Asia/Kolkata')).day).zfill(2)  + "/"  + "hour=" + str(datetime.now(timezone('Asia/Kolkata')).hour).zfill(2)
+    
+            if targetentity.lower() == 'policy':
+                #remove duplicates and get latest               
+                partitioned_dataframe = partitioned_dataframe.withColumn("created_at_temp",regexp_replace(col("created_at"),"\\+0530","\\+05:30").cast("timestamp"))                    
+                partitioned_dataframe2 = partitioned_dataframe.select(partitioned_dataframe.columns).withColumn("created_at_temp",col("created_at_temp").cast("timestamp")).filter(partitioned_dataframe['created_at_temp'].isNotNull()).groupBy("policyNumber").agg(max_("created_at_temp"))                   
+                partitioned_dataframe2 = partitioned_dataframe2.withColumnRenamed("max(created_at_temp)","created_at1").withColumnRenamed("policyNumber","policyNumber1")                    
+                partitioned_dataframe = partitioned_dataframe.join(partitioned_dataframe2, (partitioned_dataframe.policyNumber == partitioned_dataframe2.policyNumber1) & (partitioned_dataframe.created_at_temp == partitioned_dataframe2.created_at1))                    
+                
+            elif targetentity.lower() == 'payment' or targetentity.lower() == 'refund' or targetentity.lower() == 'party' or targetentity.lower() == 'policycancellation':
+                primaryid = "id"
+                if targetentity.lower() == 'payment':
+                	primaryid = "payment.id"
+                #remove duplicates and get latest               
+                partitioned_dataframe = partitioned_dataframe.withColumn("created_at_temp",regexp_replace(col("created_at"),"\\+0530","\\+05:30").cast("timestamp"))                    
+                partitioned_dataframe2 = partitioned_dataframe.select(partitioned_dataframe.columns).withColumn("created_at_temp",col("created_at_temp").cast("timestamp")).filter(partitioned_dataframe['created_at_temp'].isNotNull()).groupBy(primaryid).agg(max_("created_at_temp"))                   
+                partitioned_dataframe2 = partitioned_dataframe2.withColumnRenamed("max(created_at_temp)","created_at1").withColumnRenamed("id","id1")                    
+                if targetentity.lower() == 'payment':
+                	partitioned_dataframe = partitioned_dataframe.join(partitioned_dataframe2, (partitioned_dataframe.payment.id == partitioned_dataframe2.id1) & (partitioned_dataframe.created_at_temp == partitioned_dataframe2.created_at1))                    
+                else:
+                	partitioned_dataframe = partitioned_dataframe.join(partitioned_dataframe2, (partitioned_dataframe.id == partitioned_dataframe2.id1) & (partitioned_dataframe.created_at_temp == partitioned_dataframe2.created_at1))                     
+    
+            partitioned_dataframe = partitioned_dataframe.drop(*["id1", "created_at1","created_at_temp"])  
+            
+            #partitioned_dataframe = partitioned_dataframe.withColumn("created_at",partitioned_dataframe['created_at'].cast('timestamp').cast('string'))                                          
+            
+            partitioned_dataframe = partitioned_dataframe.repartition(1).drop_duplicates()      
+                
+            partitioned_dataframe = partitioned_dataframe.coalesce(1)	
+    
+            #merge schema with existing data
+            #reading for actual_df schema to be merged with new file      
+            
+            partitioned_dataframe_merged = partitioned_dataframe
+            
+            '''if targetentity.lower() != 'event' and targetentity.lower() != 'policy' and targetentity.lower() != 'policy-info' and targetentity.lower() != 'payment':
+                try:
+                    datasourceDynamicOrig_temp= glueContext.create_dynamic_frame_from_options("s3", {'paths': [targetpath + targetentity], 'recurse':True, 'groupFiles': 'inPartition', "mergeSchema" : "true"}, format="parquet")            
+                
+                    partitioned_dataframe_merged = fixdataframeschema(partitioned_dataframe,datasourceDynamicOrig_temp.toDF().schema)
+                
+                except:
+                    partitioned_dataframe_merged = partitioned_dataframe
+                    pass'''
+            #merge schema with existing data
+                
+            # Convert back to a DynamicFrame for further processing.
+            partitioned_dynamicframe = DynamicFrame.fromDF(partitioned_dataframe_merged, glueContext,targetentity + "_partitioned_df")
+    
+            passed_record_count = partitioned_dynamicframe.count()
+            
+            if passed_record_count > 0:
+                
+                    glueContext.write_dynamic_frame.from_options(frame = partitioned_dynamicframe, connection_type = "s3", connection_options = {"path": targetpath + targetstaging + '/' + filepath}, format = "parquet")
+    
+                    copy_latest_staging_data_for_batch(targetbucket,targetstaging + "/" + targetentity)
+        
+        delete_latest_staging_data_for_batch(targetbucket,targetstaging + "/" + targetentity)
+        
+        jobBatchMetadataRecords(JOB_NAME,sourceentity,maxbatchidint,"SUCCESS",errordesc,passed_record_count,reject_record_count)
+            
+    except Exception as e:
+        exc_type, exc_obj, exc_tb = sys.exc_info()
+        print("errordesc1=",exc_type, "line no" , exc_tb.tb_lineno)        
+        errordesc = str(e)
+        print("errordesc=" + str(errordesc))
+        jobBatchMetadataRecords(JOB_NAME,sourceentity,maxbatchidint,"FAILED",str(errordesc)[:999],None,None)
+
+
+entitynames = load_params()
+for sourceentity,targetentity in entitynames.items():
+    #print(key + "  " + value) 
+    processEntity(sourceentity,targetentity)
+    if targetentity == "suspense":
+        processEntity("hm-financeadapter-activity","financeadapter-activity")
+        processEntity("hm-financeadapter-breakdown","financeadapter-breakdown")
+
+# processEntity("hm-policy","policy")
+#processEntity("hm-servicerequest","servicerequest")
+
+'''processEntity("hm-suspense","suspense")
+processEntity("hm-financeadapter-activity","financeadapter-activity")
+processEntity("hm-financeadapter-breakdown","financeadapter-breakdown")'''
+     
+job.commit()
