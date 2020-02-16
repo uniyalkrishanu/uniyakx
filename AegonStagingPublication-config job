@@ -1,0 +1,301 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.types import *
+import json
+import boto3
+from pyspark.sql.functions import to_date,count
+import re
+from awsglue import DynamicFrame
+from pyspark.sql.types import *
+import csv
+from datetime import datetime
+import copy
+from boto3  import client as boto3_client
+from datetime import datetime, timedelta
+import dateutil
+import os
+import math
+from pyspark.sql.functions import lit,sha2,concat_ws,col,concat,format_number,regexp_replace,when,trim
+from pytz import timezone
+
+#jobfrequency = 120
+## @params: [JOB_NAME]
+args = getResolvedOptions(sys.argv, ['JOB_NAME','processing_pipeline_params_namespace'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+JOB_NAME = args['JOB_NAME']
+
+processing_pipeline_params_namespace = args['processing_pipeline_params_namespace']
+
+
+#CONFIGURATIONS
+ssm = boto3.client('ssm', region_name="ap-south-1")
+jobfrequency = 120
+s3BucketName = ssm.get_parameter(Name=processing_pipeline_params_namespace + '.targetbucket')['Parameter']['Value']
+targetbucket = ssm.get_parameter(Name=processing_pipeline_params_namespace + '.publicationbucket')['Parameter']['Value'] #"aegon-publication-datalake-store-dt"
+auroralambda = ssm.get_parameter(Name=processing_pipeline_params_namespace + '.aurora-lambda')['Parameter']['Value']
+
+sourcepath = "s3://" + s3BucketName + "/"
+targetpath = "s3://" + targetbucket + "/"
+
+
+ERROR_DESCRIPTION = 'error_description'
+targetstaging = "default_staging"
+
+#martschema = "lms_mart"
+
+s3 = boto3.resource('s3', region_name="ap-south-1")
+
+glueContext.clearCache()    
+
+def call_aurora_batch_metadata_access(payload):
+    try:
+        lambda_client = boto3_client('lambda',region_name='ap-south-1')
+        payload = json.dumps(payload)        
+        response= lambda_client.invoke(FunctionName=auroralambda,InvocationType="RequestResponse",Payload=payload,LogType="Tail")
+        res_json = json.loads(response['Payload'].read().decode("utf-8"))
+    except Exception as e: 
+        raise Exception("call_aurora_batch_metadata_access " + str(e))    
+    return res_json
+
+def jobBatchMetadataRecords(job_name,entity_name,batch_id,status,error_desc,record_count,reject_record_cnt):
+    payload = {'requesttype': 'jobbatchmetadatarecords','job_name':job_name,'entity_name': entity_name,'batch_id' : batch_id,'status': status,'error_desc' : error_desc,'record_count' : record_count,'reject_record_cnt': reject_record_cnt}
+    res_json = call_aurora_batch_metadata_access(payload)
+    if res_json is None:
+        raise Exception("jobBatchMetadataRecords failed")   
+    elif res_json["status"] == "failed":
+        raise Exception("jobBatchMetadataRecords failed" + res_json["error"]) 
+        
+    return res_json["status"]
+    
+
+def getstagingbatchid(job_name,entity_name):
+    payload = {'requesttype': 'getstagingbatchid','job_name':job_name,'entity_name': entity_name}
+    res_json = call_aurora_batch_metadata_access(payload)        
+    if res_json is None:
+        raise Exception("getstagingbatchid failed")   
+    elif res_json["status"] == "failed":
+        raise Exception("getstagingbatchid failed" + res_json["error"]) 
+        
+    return res_json["batchid"]
+
+def copy_data_to_publication_folder(s3BucketName,sourcefolder,targetfile):
+    
+    get_last_modified = lambda obj: int(obj['LastModified'].strftime('%s'))
+    
+    s3_client = boto3.client('s3')
+    objs = s3_client.list_objects_v2(Bucket=s3BucketName, Prefix=sourcefolder + "/", Delimiter='/')['Contents']
+    last_added = [obj['Key'] for obj in sorted(objs, key=get_last_modified, reverse=True)][0]      
+
+    copySource = s3BucketName + '/' + last_added
+    s3.Object(s3BucketName,targetfile).copy_from(CopySource=copySource)  
+
+def lastsuccesstimediff(job_name,entity_name):
+    payload = {'requesttype': 'lastsuccesstimediff','job_name':job_name,'entity_name': entity_name}
+    res_json = call_aurora_batch_metadata_access(payload)     
+    if res_json is None:
+        raise Exception("lastsuccesstimediff failed")   
+    elif res_json["status"] == "failed":
+        raise Exception("lastsuccesstimediff failed" + res_json["error"]) 
+        
+    return res_json["lastsuccesstimediff"]
+        
+def load_params(queries):
+    entitynames = {}
+    for query in queries:
+        publicationentity = None
+        if "publicationclass" in query:
+            publicationentity = query["publicationclass"]
+        # now query is a dictionary
+        entitynames[query["resultClass"]] = [query["inputentities"],query["sql"],query["optionalfields"],publicationentity]
+        
+    return entitynames    
+
+def hasColumn(df,field):
+	try:
+		df.select(field)
+		return True
+	except Exception as e:
+		#print(str(e))
+		return False
+
+def get_row_cat_ofi(publicationtarget):
+	datasourceDynamicOrig_temp = glueContext.read.format('com.databricks.spark.csv').option("delimiter", ",").option("mode", "DROPMALFORMED").option('quote', '"').option('escape', '"').options(header='true', inferschema='true').option("multiLine", 'true').load(publicationtarget + "/activity_hm_*.csv")
+	gexprs = ["EVENT","TASK","TRANSACTION_DATE","AMOUNT","TRANSACTION_ID","POLICY_NUMBER","PAYMENT_TYPE"]
+	for grp in gexprs:
+		datasourceDynamicOrig_temp = datasourceDynamicOrig_temp.withColumn(grp,when(datasourceDynamicOrig_temp[grp].isNull(),"*****").otherwise(datasourceDynamicOrig_temp[grp]))
+	datasourceDynamicOrig_pivot_old = datasourceDynamicOrig_temp.groupBy(gexprs).agg(count("*")).alias("counts")
+	row_cat_ofi_list = datasourceDynamicOrig_pivot_old.withColumn("row_cat_ofi", concat(trim(col('EVENT')),trim(col('TASK')),trim(col('TRANSACTION_DATE')),trim(col('POLICY_NUMBER')),trim(regexp_replace(format_number(col('AMOUNT').cast("double"),2), ",", "")), trim(when( col('TRANSACTION_ID').isNull(), "").otherwise(col('TRANSACTION_ID'))))).dropDuplicates(['row_cat_ofi']).rdd.map(lambda x: x.row_cat_ofi).collect() 
+	all_cat_ofi = "(" + ','.join("'{0}'".format(w) for w in row_cat_ofi_list) + ")"
+	return all_cat_ofi.replace("*****","") 	
+    
+parametersDict = {}
+
+def processEntity(targetstaging,sourceentities,targetentity,sqlQuery,seperator,calllambda,parameters,optionalfields,outputformat,publicationfolder,publicationdate,publicationentity):
+    errordesc = ''
+    datasourceDynamicOrig = {}
+    fieldnotfound = []
+    
+    try:
+        
+        maxbatchidint = getstagingbatchid(JOB_NAME,targetstaging)
+            
+        if not maxbatchidint:
+            maxbatchidint = 1
+        else:
+            maxbatchidint = str(1+int(maxbatchidint))
+            
+        jobfrequency = math.ceil(float(lastsuccesstimediff(JOB_NAME,targetstaging + "_" + targetentity)))            
+
+        print("Running for maxbatchidint=" + str(maxbatchidint) ) #+ " and lastsuccesstime=" + str(lastsuccesstime))
+        
+        jobBatchMetadataRecords(JOB_NAME,targetstaging + "_" + targetentity,maxbatchidint,"STARTED",errordesc,None,None)
+
+        selectQuery = "select"        
+        for ent in sourceentities:
+            datasourceDynamicOrig[ent] = glueContext.create_dynamic_frame_from_options("s3", {'paths': [sourcepath + "/" + ent ], 'recurse':True, 'groupFiles': 'inPartition', "mergeSchema" : "true"}, format="parquet")
+            dynamicdfCopy = datasourceDynamicOrig[ent]
+            try:
+                datasourceDynamicOrig[ent] = ResolveChoice.apply(datasourceDynamicOrig[ent], choice = "project:string")
+                dfschema = datasourceDynamicOrig[ent].toDF().schema.json()
+                dynamicdfCopy = datasourceDynamicOrig[ent]
+            except:
+                datasourceDynamicOrig[ent] = dynamicdfCopy
+            pass
+        
+            datasourceDynamicOrig[ent].toDF().createOrReplaceTempView(ent.replace("-","_"))
+            for field in optionalfields:
+            	if ent == field["basentity"] and hasColumn(datasourceDynamicOrig[ent].toDF(),field["name"]):
+            		selectQuery = selectQuery + " " + field["prefix"] + "" + field["name"] + " " + "AS " +  field["alias"] + "," 
+            	else:
+            		fieldnotfound.append(field["alias"])                    
+     
+        for key in parameters:
+            if "func" in parameters[key].split(":"):
+                if publicationfolder is not None:
+                    #print("globals=" + globals()[parameters[key].split(":")[1]](targetpath + publicationfolder))
+                    if key not in parametersDict:
+                        parametersDict[key] = globals()[parameters[key].split(":")[1]](targetpath + publicationfolder)                  
+                    glueContext.spark_session.sql("set " + key + "=" +  parametersDict[key])
+                    #sqlQuery = sqlQuery.replace("${row_cat_ofi}",all_hist_ofi)
+            else:
+                glueContext.spark_session.sql("set " + key + "=" +  parameters[key] )
+    
+        if 'fromdate' not in parameters:
+            lastedate = datetime.strftime(datetime.now(timezone('Asia/Kolkata')) - timedelta(days=2), '%Y-%m-%d 21:55:00') #get data from 00:30:00 PM to 00:30:00 PM 
+            glueContext.spark_session.sql("set fromdate='" +  lastedate + "'")
+
+        if 'todate' not in parameters:
+            lastedate = datetime.strftime(datetime.now(timezone('Asia/Kolkata')) - timedelta(days=1), '%Y-%m-%d 22:00:00') #get data from 22:00:00 PM to 00:30:00 PM
+            glueContext.spark_session.sql("set todate='" +  lastedate + "'") 
+ 
+        if 'fromtime' not in parameters:
+            lastedate = datetime.strftime(datetime.now(timezone('Asia/Kolkata')) - timedelta(hours=jobfrequency), '%Y-%m-%d %H:%M:%S')
+            glueContext.spark_session.sql("set fromtime='" +  lastedate + "'")
+            
+        sqlQuery = sqlQuery.replace("select",selectQuery)
+        
+        print("sqlQuery=" +str(sqlQuery))
+
+        # Query to find startPositions of each Segment  in the Response String
+        target_df = glueContext.spark_session.sql(sqlQuery).repartition(1).drop_duplicates()
+        
+        for field in fieldnotfound:
+            target_df = target_df.withColumn(field, lit(None).cast(StringType()))
+
+        target_df = target_df.coalesce(1)
+            
+        target_dynamicframe= DynamicFrame.fromDF(target_df, glueContext, targetentity + "_dynamicframe")
+
+        passed_record_count = target_dynamicframe.count()
+        
+        if passed_record_count > 0:
+            target_dynamicframe.show()
+            if outputformat == 'csv':
+                glueContext.write_dynamic_frame.from_options(frame = target_dynamicframe, connection_type = "s3", connection_options = {"path": targetpath + targetstaging + '/' + targetentity}, format = outputformat, format_options={"separator":seperator})
+            else:
+                glueContext.write_dynamic_frame.from_options(frame = target_dynamicframe, connection_type = "s3", connection_options = {"path": targetpath + targetstaging + '/' + targetentity}, format = outputformat, format_options={"separator":seperator})
+            if calllambda is not None:
+                lambda_client = boto3_client('lambda',region_name='ap-south-1')
+                payload = {'table_name': str(targetentity.lower()),'data': json.dumps(target_dynamicframe.toDF().drop_duplicates().toJSON().map(lambda j: json.loads(j)).collect())}
+                payload = json.dumps(payload)        
+                lambda_client.invoke(FunctionName=calllambda,InvocationType="RequestResponse",Payload=payload,LogType="Tail")
+            
+            if publicationfolder is not None and publicationentity is not None:
+                copy_data_to_publication_folder(targetbucket, targetstaging + '/' + targetentity,publicationfolder + "/" + publicationentity + "_" + publicationdate + "." + outputformat)
+        
+        jobBatchMetadataRecords(JOB_NAME,targetstaging + "_" + targetentity,maxbatchidint,"SUCCESS",errordesc,passed_record_count,0)
+                
+    except Exception as e:
+        print("targetentity =" + str(targetentity))
+        exc_type, exc_obj, exc_tb = sys.exc_info()
+        print("errordesc1=",exc_type, "line no" , exc_tb.tb_lineno)        
+        errordesc = str(e)
+        print("errordesc=" + str(errordesc))
+        jobBatchMetadataRecords(JOB_NAME,configpath,maxbatchidint,"FAILED",str(errordesc)[:999],None,None)
+
+
+
+s3_bucket = s3.Bucket(targetbucket)   
+try:
+    for object in s3_bucket.objects.filter(Prefix=("config")):
+        if '.json' in object.key:
+            print("object.key" + str(object.key))
+            configpath = object.key
+            
+            obj = s3.Object(targetbucket, configpath)
+            body= obj.get()['Body'].read().decode("utf-8")
+                
+            # parse x:
+            parsed_json = json.loads(body)
+            
+            targetbucket = parsed_json["output"]["outputbucket"]
+            targetstaging = parsed_json["output"]["outputfolder"]
+            outputformat = parsed_json["output"]["outputformat"]
+            
+            publicationfolder = None
+
+            if "publicationfolder" in parsed_json["output"]:
+                publicationfolder = parsed_json["output"]["publicationfolder"]
+                
+            parameters = {}
+            if "parameters" in parsed_json:
+            	for key in parsed_json["parameters"]:
+            		parameters[key] = parsed_json["parameters"][key]
+                
+            seperator = ","
+            
+            if "seperator" in parsed_json["output"]:
+                seperator = parsed_json["output"]["seperator"]
+
+            calllambda=None
+            
+            if "calllambda" in parsed_json["output"]:
+                calllambda = parsed_json["output"]["calllambda"]
+                
+            entitynames = load_params(parsed_json["queries"])
+            
+            #publish a day before as per discussion with Mayank
+            publicationdate = (datetime.now(timezone('Asia/Kolkata'))- timedelta(days = 1)).strftime("%y%m%d%H%M%S")
+            
+            for targetentity,values in entitynames.items():
+                #print(key + "  " + value) 
+                processEntity(targetstaging,values[0].split(","),targetentity,values[1],seperator,calllambda,parameters,values[2],outputformat,publicationfolder,publicationdate,values[3])
+
+except Exception as e:
+    exc_type, exc_obj, exc_tb = sys.exc_info()
+    print("errordesc1=",exc_type, "line no" , exc_tb.tb_lineno)        
+    errordesc = str(e)
+    print("errordesc=" + str(errordesc))
+#processEntity({"policy","party"},"testpolicy",sqlQuery)
+
+job.commit()
