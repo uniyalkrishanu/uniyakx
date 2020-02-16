@@ -1,0 +1,61 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.types import *
+import json
+import boto3
+from pyspark.sql.types import Row
+import re
+from awsglue import DynamicFrame
+from pyspark.sql.types import *
+import csv
+from datetime import datetime
+import copy
+from boto3  import client as boto3_client
+from datetime import datetime, timedelta
+import dateutil
+import os
+import math
+import uuid
+from pyspark.sql.functions import concat,udf,when,lit,col,to_date,date_format,lpad,max as max_ , rand,struct
+from botocore.vendored import requests
+from botocore.exceptions import ClientError
+import random
+import time
+from pytz import timezone
+from pyspark.sql.functions import concat,udf,when,lit,col,to_date,date_format,lpad,max as max_ , rand,explode,sha2, concat_ws,size,count,regexp_replace
+
+#CONFIGURATIONS
+ssm = boto3.client('ssm', region_name="ap-south-1")
+jobfrequency = 120
+s3BucketName = ssm.get_parameter(Name='/config/aegon_datalake/processing_pipeline.systemconfig.sourcebucket')['Parameter']['Value']
+targetbucket = ssm.get_parameter(Name='/config/aegon_datalake/processing_pipeline.systemconfig.targetbucket')['Parameter']['Value'] #"aegon-publication-datalake-store-dt"
+
+sourcepath = "s3://" + s3BucketName + "/"
+targetpath = "s3://" + targetbucket + "/"
+
+
+ERROR_DESCRIPTION = 'error_description'
+targetstaging = "ods_staging"
+
+#martschema = "lms_mart"
+
+s3 = boto3.resource('s3', region_name="ap-south-1")
+    
+#jobfrequency = 120
+## @params: [JOB_NAME]
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+JOB_NAME = args['JOB_NAME']
+
+
+glueContext.clearCache()
