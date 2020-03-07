@@ -1,0 +1,13 @@
+def query_dynamo_record_by_parition_sort_key(self, partition_key, partition_value,
+                                                 sort_key, sort_value):
+        try:
+            response = self.table.query(
+                KeyConditionExpression=Key(partition_key).eq(partition_value)
+                                       & Key(sort_key).gte(sort_value))
+            for record in response.get('Items'):
+                print(json.dumps(record, cls=DecimalEncoder))
+            return
+
+        except Exception as e:
+            print('Exception %s type' % str(type(e)))
+            print('Exception message: %s ' % str(e)) 
